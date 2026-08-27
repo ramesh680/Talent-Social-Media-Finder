@@ -1,0 +1,1638 @@
+From 0420edc6e5f5eb64e65ca1bc30b5976e104d627c Mon Sep 17 00:00:00 2001
+From: Ramesh Goswami <ramesh@listenfirstmedia.com>
+Date: Thu, 27 Aug 2026 15:45:47 +0000
+Subject: [PATCH] v0.5.0: bulk CSV/XLSX upload with tolerant headers and
+ budgeted batching
+
+- bulk.py: parse .xlsx/.csv (delimiter sniffing, BOM/latin-1 fallback, legend
+  blocks above the header). Header aliasing so client sheets work untouched:
+  Talent Name/Title/Full Name -> name, Title Category -> role, Sr. No. -> row_id.
+  Role synonyms mapped; an unrecognised role is DROPPED with a warning, never
+  guessed, since a wrong hint pushes the resolver at the wrong person.
+- Header DETECTION is strict, header MAPPING is loose. A title cell like
+  'Talent list for Q3' contains 'talent' and was being read as the header row.
+- run_batch works to a wall-clock budget and returns unattempted rows, because
+  ~5-10s per name against a 120s gunicorn timeout cannot finish a long sheet.
+- template.py: fill-in workbook - Instructions, Input (6 examples incl. a
+  Devanagari name, role dropdown, yellow input cells), Reference.
+- app.py: /api/bulk/validate (parse only, no upstream cost), /api/bulk,
+  /api/bulk/export, /api/template.xlsx, /api/template.csv. 4MB upload cap.
+- UI: tabbed single/bulk, drag-drop, header-mapping preview, per-decision
+  counts, results grid, Excel/CSV download.
+- Fixed alias registration bug: keys held underscores while lookup normalised
+  to spaces, so every underscored alias (row_id, active_year) silently missed.
+
+256/256 tests pass across four suites. No credentials in any file.
+---
+ README.md                 |  55 ++++
+ app.py                    | 140 +++++++++-
+ identityforge/__init__.py |   4 +-
+ identityforge/bulk.py     | 551 ++++++++++++++++++++++++++++++++++++++
+ identityforge/template.py | 267 ++++++++++++++++++
+ requirements.txt          |   1 +
+ templates/index.html      | 230 +++++++++++++++-
+ tests/test_bulk.py        | 235 ++++++++++++++++
+ 8 files changed, 1480 insertions(+), 3 deletions(-)
+ create mode 100644 identityforge/bulk.py
+ create mode 100644 identityforge/template.py
+ create mode 100644 tests/test_bulk.py
+
+diff --git a/README.md b/README.md
+index b8b12a2..2dc9cbf 100644
+--- a/README.md
++++ b/README.md
+@@ -31,6 +31,8 @@ node the person themselves attached their accounts to. Two consequences:
+ | `providers.py` | TMDB person search that refuses to guess on a collision; OMDb title context. |
+ | `discovery.py` | SerpAPI handle discovery. Proposals are Tier 5 — search can never auto-accept. |
+ | `fetcher.py` | Cached, rate-limited, allowlisted HTTP with query-string secret redaction. |
++| `bulk.py` | CSV/XLSX ingest with tolerant header mapping, batching under a wall-clock budget, and CSV/XLSX writers. |
++| `template.py` | Generates the fill-in upload template (Instructions / Input / Reference sheets). |
+ 
+ ## Evidence tiers
+ 
+@@ -81,6 +83,59 @@ IF_LIVE=1 python app.py  # real Wikidata / TMDB / MusicBrainz / link-in-bio
+ | `GET /api/audit` | P-number self-audit; validates against Wikidata in live mode |
+ | `GET /api/health` | mode + version, used as Render's health check |
+ 
++## Bulk upload
++
++Download the template from the running app: `/api/template.xlsx` or
++`/api/template.csv`.
++
++**Only `name` is required.** Headers are matched loosely, so a sheet that came
++from a client or a Zendesk export usually works untouched — `Talent Name`,
++`Title`, `Full Name`, `Artist Name` all map to `name`; `Title Category` and
++`Occupation` map to `role`; `Sr. No.` and `TICKET-ID` map to `row_id`.
++
++| column | required | what it does |
++|---|---|---|
++| `name` | **yes** | Punctuation, diacritic and initials variants are handled. Non-Latin scripts are searched in their own language. |
++| `role` | strongly recommended | The single most valuable field — without it a shared name returns `disambiguate` instead of an answer. |
++| `active_year` | no | Rules out candidates dead or unborn at the time. |
++| `country` | no | Country name or a Wikidata Q-id. |
++| `context` | no | Show, brand or campaign. Recorded for audit. |
++| `client` | no | Account or brand set. Recorded for audit. |
++| `row_id` | no | Echoed back so you can join results to your source sheet. |
++| `notes` | no | Passed through. |
++
++Role synonyms are mapped (`singer`→musician, `footballer`→athlete,
++`actress`→actor, `influencer`→creator). An **unrecognised** role is dropped with
++a warning rather than guessed — a wrong role hint is worse than none, because it
++actively pushes the resolver at the wrong person.
++
++### Endpoints
++
++| route | does |
++|---|---|
++| `POST /api/bulk/validate` | Parse and report **without resolving**. Shows how each header was read and which rows will be skipped, before spending upstream quota. |
++| `POST /api/bulk` | Resolve. `max_rows` and `budget_seconds` form fields. |
++| `POST /api/bulk/export` | JSON rows back out as `.xlsx` or `.csv`. |
++
++### Why batches are small
++
++Live resolution costs roughly 5–10 seconds per name, because the rate limiter
++deliberately paces MusicBrainz at 1.1s and Wikidata at 0.4s. Against a 120s
++gunicorn timeout that is ~15–25 names per request, so `run_batch` works to a
++wall-clock budget and returns the rows it did not attempt instead of dying at
++row 14. Resubmit those; the HTTP cache makes the second pass much cheaper.
++
++For hundreds of names, run it locally where there is no HTTP timeout.
++
++### Output
++
++One row per input row, with the eight platform columns plus `decision`,
++`entity_id`, `coverage`, `needs_review`, `spoke_ids`, `alternates` and `notes`.
++Four decisions are visibly distinct: `resolved`, `disambiguate` (candidates in
++`alternates`), `unverified_only` (search proposals, confirm before use) and
++`not_found`. Platform columns stay **empty** unless a handle was actually
++accepted — a guess is never written into a handle column.
++
+ ### Deploy to Render
+ 
+ `render.yaml` is a blueprint — point Render at the repo and it reads it. Free plan,
+diff --git a/app.py b/app.py
+index 6a337d0..8a9cb57 100644
+--- a/app.py
++++ b/app.py
+@@ -20,8 +20,12 @@ import json
+ import os
+ from flask import Flask, jsonify, render_template, request
+ 
++from flask import Response, send_file
++
+ from identityforge import authorities
+ from identityforge.authorities import OCCUPATION_BUCKETS
++from identityforge import bulk as bulk_mod
++from identityforge.template import build_template_csv, build_template_xlsx
+ from identityforge.discovery import discover
+ from identityforge.fetcher import CachedFetcher, FixtureFetcher, build_fetcher
+ from identityforge.providers import omdb_title, search_person
+@@ -146,7 +150,7 @@ def index():
+ def health():
+     return jsonify({"ok": True, "mode": "live" if LIVE else "demo",
+                     "tmdb_key_present": _present(TMDB_KEY),
+-                    "version": "0.4.0"})
++                    "version": "0.5.0"})
+ 
+ 
+ @app.get("/api/config")
+@@ -309,5 +313,139 @@ def api_omdb_title():
+                    {"error": "Not found in OMDb."})
+ 
+ 
++# ---------------------------------------------------------------------------
++# bulk upload
++# ---------------------------------------------------------------------------
++
++MAX_UPLOAD_BYTES = 4 * 1024 * 1024
++app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
++
++
++@app.get("/api/template.xlsx")
++def template_xlsx():
++    data = build_template_xlsx()
++    return Response(
++        data,
++        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++        headers={"Content-Disposition":
++                 'attachment; filename="talent-finder-template.xlsx"'})
++
++
++@app.get("/api/template.csv")
++def template_csv():
++    return Response(build_template_csv(), mimetype="text/csv",
++                    headers={"Content-Disposition":
++                             'attachment; filename="talent-finder-template.csv"'})
++
++
++@app.post("/api/bulk/validate")
++def bulk_validate():
++    """
++    Parse and report WITHOUT resolving anything.
++
++    Worth its own endpoint: it tells the operator how their headers were read
++    and which rows will be skipped, before spending any upstream quota.
++    """
++    f = request.files.get("file")
++    if not f:
++        return jsonify({"error": "No file uploaded (form field 'file')."}), 400
++    data = f.read()
++    if not data:
++        return jsonify({"error": "The uploaded file is empty."}), 400
++
++    parsed = bulk_mod.parse_upload(f.filename or "", data)
++    if parsed.errors:
++        return jsonify({"error": parsed.errors[0], "errors": parsed.errors,
++                        "header_map": parsed.header_map,
++                        "unmapped_headers": parsed.unmapped_headers}), 422
++
++    return jsonify({
++        "filename": f.filename,
++        "header_map": parsed.header_map,
++        "unmapped_headers": parsed.unmapped_headers,
++        "total_rows": len(parsed.rows),
++        "valid_rows": len(parsed.valid_rows),
++        "skipped_rows": [{"row_number": r.row_number,
++                          "why": "; ".join(r.warnings) or "empty name"}
++                         for r in parsed.invalid_rows],
++        "warnings": [{"row_number": r.row_number, "warnings": r.warnings}
++                     for r in parsed.valid_rows if r.warnings][:50],
++        "with_role": sum(1 for r in parsed.valid_rows if r.role),
++        "without_role": sum(1 for r in parsed.valid_rows if not r.role),
++        "preview": [{"row_id": r.row_id, "name": r.name, "role": r.role,
++                     "active_year": r.active_year, "country": r.country}
++                    for r in parsed.valid_rows[:10]],
++        "note": ("Rows without a role will usually come back as "
++                 "'disambiguate' if the name is shared."),
++    })
++
++
++@app.post("/api/bulk")
++def bulk_resolve():
++    f = request.files.get("file")
++    if not f:
++        return jsonify({"error": "No file uploaded (form field 'file')."}), 400
++    data = f.read()
++    if not data:
++        return jsonify({"error": "The uploaded file is empty."}), 400
++
++    parsed = bulk_mod.parse_upload(f.filename or "", data)
++    if parsed.errors:
++        return jsonify({"error": parsed.errors[0],
++                        "errors": parsed.errors}), 422
++    if not parsed.valid_rows:
++        return jsonify({"error": "No rows with a name were found."}), 422
++
++    try:
++        max_rows = min(int(request.form.get("max_rows", 500)), 1000)
++    except ValueError:
++        max_rows = 500
++    try:
++        budget = min(float(request.form.get("budget_seconds", 75)), 100.0)
++    except ValueError:
++        budget = 75.0
++
++    fetch = _fetcher()
++
++    def resolve_one(pr):
++        return resolve(
++            Intake(name=pr.name, expected_role=pr.role or None,
++                   country=pr.country or None, active_year=pr.active_year,
++                   context=pr.context, client=pr.client),
++            fetch, _store, tmdb_key=TMDB_KEY, do_bidirectional=False,
++            serpapi_key=SERPAPI_KEY, serpapi_engine=SERPAPI_ENGINE)
++
++    batch = bulk_mod.run_batch(parsed, resolve_one, max_rows=max_rows,
++                               time_budget_seconds=budget)
++    payload = batch.as_dict()
++    payload["mode"] = "live" if LIVE else "demo"
++    payload["header_map"] = parsed.header_map
++    counts: dict[str, int] = {}
++    for r in batch.rows:
++        d = str(r.get("decision", "?"))
++        counts[d] = counts.get(d, 0) + 1
++    payload["decision_counts"] = counts
++    return jsonify(payload)
++
++
++@app.post("/api/bulk/export")
++def bulk_export():
++    """Turn a JSON result set back into a downloadable sheet."""
++    body = request.get_json(silent=True) or {}
++    rows = body.get("rows") or []
++    if not isinstance(rows, list) or not rows:
++        return jsonify({"error": "No rows to export."}), 400
++    fmt = (body.get("format") or "xlsx").lower()
++    if fmt == "csv":
++        return Response(bulk_mod.to_csv(rows), mimetype="text/csv",
++                        headers={"Content-Disposition":
++                                 'attachment; filename="talent-finder-results.csv"'})
++    return Response(
++        bulk_mod.to_xlsx(rows),
++        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++        headers={"Content-Disposition":
++                 'attachment; filename="talent-finder-results.xlsx"'})
++
++
+ if __name__ == "__main__":
+     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8020)), debug=False)
+diff --git a/identityforge/__init__.py b/identityforge/__init__.py
+index 8b36980..2c63945 100644
+--- a/identityforge/__init__.py
++++ b/identityforge/__init__.py
+@@ -7,7 +7,9 @@ from .discovery import discover, DiscoveryResult, Proposal
+ from .providers import search_person, enrich_from_tmdb, omdb_title
+ from .labels import normalize, variants, match_label, script_of, search_languages
+ from .wikidata import find_candidates
++from .bulk import parse_upload, run_batch, to_csv, to_xlsx, INPUT_COLUMNS, OUTPUT_COLUMNS
++from .template import build_template_xlsx, build_template_csv
+ from .fetcher import CachedFetcher, FixtureFetcher, build_fetcher, redact
+ from . import authorities
+ 
+-__version__ = "0.4.0"
++__version__ = "0.5.0"
+diff --git a/identityforge/bulk.py b/identityforge/bulk.py
+new file mode 100644
+index 0000000..1ca304d
+--- /dev/null
++++ b/identityforge/bulk.py
+@@ -0,0 +1,551 @@
++"""
++Bulk ingest for CSV / XLSX.
++
++Design constraints that shaped this, all of them real:
++
++1. HEADERS ARE NEVER WHAT YOU SPECIFIED. A sheet that came from a client, a
++   Zendesk export or a colleague will say "Talent Name" or "title" or
++   "Full Name", not "name". Rejecting the file over a header is the fastest way
++   to make a tool unused, so headers are matched tolerantly and the mapping is
++   reported back so the operator can see how each column was read.
++
++2. A BULK RUN CANNOT FINISH INSIDE AN HTTP REQUEST. Live resolution costs
++   roughly 4-10 upstream calls per name, and the rate limiter deliberately
++   paces MusicBrainz at 1.1s and Wikidata at 0.4s. That is ~5-10 seconds per
++   name, against a 120s gunicorn timeout. So this processes under a wall-clock
++   budget and returns the unprocessed rows rather than dying at row 14. The
++   operator resubmits the remainder; the HTTP cache makes the second pass
++   cheaper.
++
++3. PARTIAL SUCCESS MUST BE LEGIBLE. Every output row carries its decision and
++   its evidence, so 'resolved', 'needs a human', and 'not attempted' are three
++   visibly different states, not three flavours of blank.
++"""
++
++from __future__ import annotations
++
++import csv
++import io
++import time
++from dataclasses import dataclass, field
++from typing import Callable, Iterable, Optional
++
++from .authorities import OCCUPATION_BUCKETS
++from .platforms import TARGET_PLATFORMS, Platform
++
++# ---------------------------------------------------------------------------
++# schema
++# ---------------------------------------------------------------------------
++
++INPUT_COLUMNS = ["row_id", "name", "role", "active_year", "country",
++                 "context", "client", "notes"]
++REQUIRED_COLUMNS = ["name"]
++
++PLATFORM_ORDER = [Platform.FACEBOOK, Platform.INSTAGRAM, Platform.TWITTER,
++                  Platform.YOUTUBE, Platform.WIKIPEDIA, Platform.IMDB,
++                  Platform.TIKTOK, Platform.LINKEDIN]
++
++OUTPUT_COLUMNS = (
++    ["row_id", "name", "decision", "entity_id", "label", "roles",
++     "coverage", "label_match"]
++    + [p.value for p in PLATFORM_ORDER]
++    + ["needs_review", "spoke_ids", "alternates", "notes"]
++)
++
++# Header aliases. Lowercased, punctuation stripped, spaces collapsed.
++_ALIASES: dict[str, str] = {}
++
++
++def _norm_header(raw) -> str:
++    """The single normalisation used for BOTH registration and lookup.
++
++    Registering 'row_id' while lookup normalises to 'row id' silently loses the
++    alias, so both sides must go through this one function.
++    """
++    if raw is None:
++        return ""
++    s = str(raw).strip().lower()
++    for ch in ("_", "-", ".", "/", "\\"):
++        s = s.replace(ch, " ")
++    return " ".join(s.split())
++
++
++def _register(canonical: str, *aliases: str) -> None:
++    for a in (canonical,) + aliases:
++        k = _norm_header(a)
++        if k:
++            _ALIASES[k] = canonical
++
++
++_register("name", "talent name", "talent", "full name", "fullname", "title",
++          "person", "person name", "celebrity", "influencer", "creator",
++          "artist", "artist name", "profile name", "entity", "entity name")
++_register("role", "expected role", "category", "title category",
++          "title_category", "occupation", "profession", "type", "vertical",
++          "sub category", "title sub category")
++_register("active_year", "year", "active year", "release year", "campaign year",
++          "reference year")
++_register("country", "citizenship", "nationality", "market", "region",
++          "country qid")
++_register("context", "show", "brand", "campaign", "programme", "program",
++          "series", "project", "note context", "source")
++_register("client", "account", "customer", "brand set", "brandset")
++_register("row_id", "id", "row", "sr no", "srno", "s no", "sno", "index",
++          "ticket", "ticket id", "request id")
++_register("notes", "note", "comment", "comments", "remarks")
++
++
++def canon_header(raw: str, strict: bool = False) -> Optional[str]:
++    """
++    Map a spreadsheet header to a canonical field, or None if unrecognised.
++
++    strict=True disables the substring fallback. Use it when DETECTING which
++    row is the header: a title cell like "Talent list for Q3" contains the
++    token "talent" and would otherwise be read as a name column, making the
++    title row the header and the subtitle row the first record.
++    """
++    k = _norm_header(raw)
++    if not k:
++        return None
++    if k in _ALIASES:
++        return _ALIASES[k]
++    if strict:
++        return None
++    # a real header may be decorated: "Talent Name (English)"
++    if len(k) > 60:
++        return None                 # a sentence, not a column heading
++    # longest alias first, so 'talent name' beats 'talent'
++    for alias, canonical in sorted(_ALIASES.items(), key=lambda kv: -len(kv[0])):
++        if len(alias) > 3 and alias in k:
++            return canonical
++    return None
++
++
++def score_header_row(row: list) -> int:
++    """How many cells in `row` are recognisable column headings, strictly."""
++    seen = set()
++    for cell in row:
++        c = canon_header(cell, strict=True)
++        if c:
++            seen.add(c)
++    return len(seen)
++
++
++# Country names -> Wikidata Q-ids, for the markets that actually appear in
++# ListenFirst work. An unrecognised value is passed through untouched so a
++# raw Q-id still works.
++COUNTRY_QIDS = {
++    "india": "Q668", "united states": "Q30", "usa": "Q30", "us": "Q30",
++    "united kingdom": "Q145", "uk": "Q145", "canada": "Q16",
++    "australia": "Q408", "japan": "Q17", "south korea": "Q884",
++    "korea": "Q884", "france": "Q142", "germany": "Q183", "spain": "Q29",
++    "italy": "Q38", "brazil": "Q155", "mexico": "Q96", "nigeria": "Q1033",
++    "indonesia": "Q252", "philippines": "Q928", "thailand": "Q869",
++    "china": "Q148", "russia": "Q159", "netherlands": "Q55", "sweden": "Q34",
++    "uae": "Q878", "saudi arabia": "Q851", "singapore": "Q334",
++}
++
++
++def canon_country(value: str) -> str:
++    v = (value or "").strip()
++    if not v:
++        return ""
++    if v.upper().startswith("Q") and v[1:].isdigit():
++        return v.upper()
++    return COUNTRY_QIDS.get(v.lower(), v)
++
++
++def canon_role(value: str) -> tuple[str, str]:
++    """Return (role, warning). Unknown roles are dropped, not guessed."""
++    v = " ".join((value or "").strip().lower().split())
++    if not v:
++        return "", ""
++    if v in OCCUPATION_BUCKETS:
++        return v, ""
++    synonyms = {
++        "singer": "musician", "music": "musician", "musician/singer": "musician",
++        "composer": "musician", "rapper": "musician", "band": "musician",
++        "actor": "actor", "actress": "actor", "film": "actor", "tv": "actor",
++        "movie": "actor", "director": "director", "filmmaker": "director",
++        "producer": "director", "athlete": "athlete", "sports": "athlete",
++        "sport": "athlete", "cricketer": "athlete", "footballer": "athlete",
++        "youtuber": "creator", "streamer": "creator", "influencer": "creator",
++        "content creator": "creator", "digital creator": "creator",
++        "model": "model", "journalist": "journalist", "anchor": "journalist",
++        "politician": "politician", "writer": "writer", "author": "writer",
++        "ceo": "executive", "founder": "executive", "executive": "executive",
++        "comedian": "comedian", "chef": "chef",
++    }
++    if v in synonyms:
++        return synonyms[v], ""
++    return "", f"unrecognised role {value!r} - treated as unknown"
++
++
++# ---------------------------------------------------------------------------
++# parsing
++# ---------------------------------------------------------------------------
++
++@dataclass
++class ParsedRow:
++    row_number: int
++    name: str = ""
++    role: str = ""
++    active_year: Optional[int] = None
++    country: str = ""
++    context: str = ""
++    client: str = ""
++    notes: str = ""
++    warnings: list[str] = field(default_factory=list)
++    row_id: str = ""
++
++    @property
++    def valid(self) -> bool:
++        return bool(self.name.strip())
++
++
++@dataclass
++class ParseResult:
++    rows: list[ParsedRow] = field(default_factory=list)
++    header_map: dict[str, str] = field(default_factory=dict)
++    unmapped_headers: list[str] = field(default_factory=list)
++    errors: list[str] = field(default_factory=list)
++
++    @property
++    def valid_rows(self) -> list[ParsedRow]:
++        return [r for r in self.rows if r.valid]
++
++    @property
++    def invalid_rows(self) -> list[ParsedRow]:
++        return [r for r in self.rows if not r.valid]
++
++
++def _coerce_year(v) -> tuple[Optional[int], str]:
++    s = str(v or "").strip()
++    if not s:
++        return None, ""
++    s = s.split(".")[0]                     # Excel gives 2005.0
++    if s.isdigit() and 1800 <= int(s) <= 2100:
++        return int(s), ""
++    return None, f"ignored active_year {v!r}"
++
++
++def _build_rows(header: list, data_rows: Iterable[list]) -> ParseResult:
++    res = ParseResult()
++    mapping: dict[int, str] = {}
++    for i, h in enumerate(header):
++        c = canon_header(h)
++        if c:
++            # first column wins, so a stray later match cannot hijack a field
++            if c not in mapping.values():
++                mapping[i] = c
++                res.header_map[str(h)] = c
++        elif str(h or "").strip():
++            res.unmapped_headers.append(str(h).strip())
++
++    if "name" not in mapping.values():
++        res.errors.append(
++            "No name column found. Add a column headed 'name' (or Talent Name, "
++            "Full Name, Title). Headers seen: "
++            + ", ".join(str(h) for h in header if str(h or "").strip()))
++        return res
++
++    for n, raw in enumerate(data_rows, start=2):
++        if not any(str(c or "").strip() for c in raw):
++            continue                        # blank row
++        pr = ParsedRow(row_number=n)
++        for idx, field_name in mapping.items():
++            val = raw[idx] if idx < len(raw) else ""
++            val = "" if val is None else str(val).strip()
++            if field_name == "name":
++                pr.name = val
++            elif field_name == "role":
++                pr.role, w = canon_role(val)
++                if w:
++                    pr.warnings.append(w)
++            elif field_name == "active_year":
++                pr.active_year, w = _coerce_year(val)
++                if w:
++                    pr.warnings.append(w)
++            elif field_name == "country":
++                pr.country = canon_country(val)
++            elif field_name == "context":
++                pr.context = val
++            elif field_name == "client":
++                pr.client = val
++            elif field_name == "notes":
++                pr.notes = val
++            elif field_name == "row_id":
++                pr.row_id = val
++        if not pr.row_id:
++            pr.row_id = str(n - 1)
++        if not pr.valid:
++            pr.warnings.append("empty name - skipped")
++        res.rows.append(pr)
++    return res
++
++
++def parse_csv(data: bytes) -> ParseResult:
++    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
++        try:
++            text = data.decode(encoding)
++            break
++        except UnicodeDecodeError:
++            continue
++    else:
++        r = ParseResult()
++        r.errors.append("Could not decode the file as UTF-8 or Latin-1.")
++        return r
++    try:
++        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
++    except csv.Error:
++        dialect = csv.excel
++    reader = list(csv.reader(io.StringIO(text), dialect))
++    if not reader:
++        r = ParseResult()
++        r.errors.append("The file is empty.")
++        return r
++    return _build_rows(reader[0], reader[1:])
++
++
++def parse_xlsx(data: bytes) -> ParseResult:
++    try:
++        from openpyxl import load_workbook
++    except ImportError:                                   # pragma: no cover
++        r = ParseResult()
++        r.errors.append("openpyxl is not installed - cannot read .xlsx.")
++        return r
++    try:
++        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
++    except Exception as exc:                              # noqa: BLE001
++        r = ParseResult()
++        r.errors.append(f"Could not open the workbook: {exc}")
++        return r
++
++    # Prefer a sheet named Input; else the first sheet with a usable header.
++    sheets = list(wb.worksheets)
++    chosen = next((s for s in sheets if s.title.strip().lower() == "input"),
++                  sheets[0] if sheets else None)
++    if chosen is None:
++        r = ParseResult()
++        r.errors.append("The workbook has no sheets.")
++        return r
++
++    rows = [list(r) for r in chosen.iter_rows(values_only=True)]
++    wb.close()
++    if not rows:
++        r = ParseResult()
++        r.errors.append(f"Sheet {chosen.title!r} is empty.")
++        return r
++
++    # Tolerate a title/legend block above the real header. Pick the row in the
++    # first 15 that looks most like a header (most strictly-recognised columns,
++    # and must include a name column); earliest wins a tie.
++    header_idx, best = 0, -1
++    for i, row in enumerate(rows[:15]):
++        if not any(canon_header(c, strict=True) == "name" for c in row):
++            continue
++        sc = score_header_row(row)
++        if sc > best:
++            best, header_idx = sc, i
++    if best < 0:
++        # no strict hit anywhere - fall back to a loose scan so decorated
++        # headers like "Talent Name (English)" still work
++        for i, row in enumerate(rows[:15]):
++            if any(canon_header(c) == "name" for c in row):
++                header_idx = i
++                break
++    return _build_rows(rows[header_idx], rows[header_idx + 1:])
++
++
++def parse_upload(filename: str, data: bytes) -> ParseResult:
++    lower = (filename or "").lower()
++    if lower.endswith((".xlsx", ".xlsm", ".xltx")):
++        return parse_xlsx(data)
++    if lower.endswith((".csv", ".tsv", ".txt")):
++        return parse_csv(data)
++    # sniff: xlsx is a zip
++    if data[:2] == b"PK":
++        return parse_xlsx(data)
++    return parse_csv(data)
++
++
++# ---------------------------------------------------------------------------
++# running a batch
++# ---------------------------------------------------------------------------
++
++def flatten_result(pr: ParsedRow, result: dict) -> dict:
++    """One resolver result -> one output row."""
++    out = {c: "" for c in OUTPUT_COLUMNS}
++    out["row_id"] = pr.row_id
++    out["name"] = pr.name
++    out["notes"] = "; ".join([pr.notes] + pr.warnings).strip("; ")
++    decision = result.get("decision", "error")
++    out["decision"] = decision
++
++    if decision == "resolved":
++        out["entity_id"] = result.get("entity_id", "")
++        out["label"] = result.get("label", "")
++        out["roles"] = ", ".join(result.get("roles") or [])
++        out["coverage"] = result.get("coverage", "")
++        handles = result.get("handles") or {}
++        for plat in PLATFORM_ORDER:
++            hs = handles.get(plat.value) or []
++            # multiple wikipedia languages are normal; join them
++            out[plat.value] = " | ".join(
++                f"{h['handle']}" + (f" ({h['lang']})" if h.get("lang") else "")
++                for h in hs)
++        out["needs_review"] = " | ".join(
++            f"{r['platform']}:{r['handle']}@{r['confidence']}"
++            for r in (result.get("needs_review") or []))
++        ids = result.get("external_ids") or {}
++        out["spoke_ids"] = " | ".join(f"{k}={v}" for k, v in sorted(ids.items()))
++
++    elif decision == "disambiguate":
++        out["alternates"] = " | ".join(
++            f"{c['entity_id']}:{','.join(c.get('roles') or []) or '?'}"
++            f":{(c.get('description') or '')[:40]}"
++            for c in (result.get("cards") or []))
++        out["notes"] = "; ".join(filter(None, [out["notes"],
++                                              result.get("reason", "")]))
++
++    elif decision == "unverified_only":
++        out["alternates"] = " | ".join(
++            f"{p['platform']}:{p['handle']}"
++            for p in (result.get("proposals") or [])[:12])
++        out["notes"] = "; ".join(filter(None, [
++            out["notes"],
++            "search proposals only - UNVERIFIED, confirm before use"]))
++
++    elif decision == "not_found":
++        out["notes"] = "; ".join(filter(None, [
++            out["notes"], "no matching human in the identity graph"]))
++    else:
++        out["notes"] = "; ".join(filter(None, [
++            out["notes"], str(result.get("error") or "error")]))
++    return out
++
++
++@dataclass
++class BatchResult:
++    rows: list[dict] = field(default_factory=list)
++    processed: int = 0
++    skipped: list[dict] = field(default_factory=list)
++    unprocessed: list[dict] = field(default_factory=list)
++    seconds: float = 0.0
++    stopped_because: str = ""
++
++    def as_dict(self) -> dict:
++        return {"columns": OUTPUT_COLUMNS, "rows": self.rows,
++                "processed": self.processed, "skipped": self.skipped,
++                "unprocessed": self.unprocessed,
++                "seconds": round(self.seconds, 1),
++                "stopped_because": self.stopped_because}
++
++
++def run_batch(parsed: ParseResult, resolve_one: Callable[[ParsedRow], dict],
++              max_rows: int = 500,
++              time_budget_seconds: float = 75.0) -> BatchResult:
++    """
++    Resolve rows under a wall-clock budget.
++
++    Returns whatever finished plus the rows it did not attempt, so a long sheet
++    degrades into 'resubmit the rest' rather than a timeout with nothing to
++    show. The HTTP cache makes the follow-up pass much cheaper.
++    """
++    br = BatchResult()
++    started = time.monotonic()
++
++    for pr in parsed.invalid_rows:
++        br.skipped.append({"row_number": pr.row_number, "row_id": pr.row_id,
++                           "why": "; ".join(pr.warnings) or "empty name"})
++
++    todo = parsed.valid_rows[:max_rows]
++    for pr in parsed.valid_rows[max_rows:]:
++        br.unprocessed.append({"row_number": pr.row_number, "name": pr.name,
++                               "why": f"beyond max_rows={max_rows}"})
++
++    for i, pr in enumerate(todo):
++        elapsed = time.monotonic() - started
++        if elapsed > time_budget_seconds and i > 0:
++            br.stopped_because = (
++                f"time budget of {time_budget_seconds:.0f}s reached after "
++                f"{i} of {len(todo)} rows - resubmit the remainder")
++            for rest in todo[i:]:
++                br.unprocessed.append({"row_number": rest.row_number,
++                                       "name": rest.name,
++                                       "why": "time budget"})
++            break
++        try:
++            result = resolve_one(pr)
++        except Exception as exc:                          # noqa: BLE001
++            result = {"decision": "error", "error": str(exc)[:200]}
++        br.rows.append(flatten_result(pr, result))
++        br.processed += 1
++
++    br.seconds = time.monotonic() - started
++    return br
++
++
++# ---------------------------------------------------------------------------
++# output writers
++# ---------------------------------------------------------------------------
++
++def to_csv(rows: list[dict]) -> bytes:
++    buf = io.StringIO()
++    w = csv.DictWriter(buf, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
++    w.writeheader()
++    for r in rows:
++        w.writerow(r)
++    return buf.getvalue().encode("utf-8-sig")
++
++
++def to_xlsx(rows: list[dict]) -> bytes:
++    from openpyxl import Workbook
++    from openpyxl.styles import Alignment, Font, PatternFill
++    from openpyxl.utils import get_column_letter
++
++    wb = Workbook()
++    ws = wb.active
++    ws.title = "Results"
++
++    head_fill = PatternFill("solid", fgColor="16243F")
++    head_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
++    body = Font(name="Arial", size=10)
++
++    ws.append(OUTPUT_COLUMNS)
++    for c in range(1, len(OUTPUT_COLUMNS) + 1):
++        cell = ws.cell(row=1, column=c)
++        cell.fill = head_fill
++        cell.font = head_font
++        cell.alignment = Alignment(vertical="center", wrap_text=True)
++
++    verdict_fill = {
++        "resolved": PatternFill("solid", fgColor="E4F2EC"),
++        "disambiguate": PatternFill("solid", fgColor="FDF3E0"),
++        "unverified_only": PatternFill("solid", fgColor="FDF3E0"),
++        "not_found": PatternFill("solid", fgColor="FBECEB"),
++        "error": PatternFill("solid", fgColor="FBECEB"),
++    }
++
++    for r in rows:
++        ws.append([r.get(c, "") for c in OUTPUT_COLUMNS])
++        row_idx = ws.max_row
++        fill = verdict_fill.get(str(r.get("decision", "")))
++        for c in range(1, len(OUTPUT_COLUMNS) + 1):
++            cell = ws.cell(row=row_idx, column=c)
++            cell.font = body
++            cell.alignment = Alignment(vertical="top", wrap_text=False)
++            if fill and OUTPUT_COLUMNS[c - 1] == "decision":
++                cell.fill = fill
++
++    widths = {"row_id": 8, "name": 24, "decision": 15, "entity_id": 11,
++              "label": 24, "roles": 16, "coverage": 9, "label_match": 14,
++              "needs_review": 34, "spoke_ids": 40, "alternates": 44,
++              "notes": 34}
++    for i, col in enumerate(OUTPUT_COLUMNS, start=1):
++        ws.column_dimensions[get_column_letter(i)].width = widths.get(col, 18)
++    ws.freeze_panes = "C2"
++
++    buf = io.BytesIO()
++    wb.save(buf)
++    return buf.getvalue()
+diff --git a/identityforge/template.py b/identityforge/template.py
+new file mode 100644
+index 0000000..a2fea7e
+--- /dev/null
++++ b/identityforge/template.py
+@@ -0,0 +1,267 @@
++"""
++Generates the upload template.
++
++Per the house rule for a workbook someone else fills in: a legend naming the
++cells to edit, and example rows showing realistic values in the expected
++format. Three sheets: Instructions, Input (with examples to delete), Reference.
++"""
++
++from __future__ import annotations
++
++import io
++
++from .authorities import OCCUPATION_BUCKETS
++from .bulk import COUNTRY_QIDS, INPUT_COLUMNS, OUTPUT_COLUMNS
++
++EXAMPLE_ROWS = [
++    ["1", "A. R. Rahman", "musician", 2010, "India",
++     "Slumdog Millionaire soundtrack", "Sony Music",
++     "punctuation variant of the name is fine"],
++    ["2", "Michael Jackson", "musician", 2005, "United States",
++     "Sony catalogue", "Sony Music",
++     "same name as a footballer and a beer writer - role decides"],
++    ["3", "Michael Jackson", "athlete", 2000, "United Kingdom", "", "",
++     "same name, different person, different role hint"],
++    ["4", "Christopher Nolan", "director", 2023, "United Kingdom",
++     "Oppenheimer", "Universal", ""],
++    ["5", "Priyanka Chopra", "actor", 2022, "India", "Citadel", "Prime Video",
++     "married name Priyanka Chopra Jonas also matches"],
++    ["6", "शाहरुख़ ख़ान", "actor", 2023, "India", "Jawan", "",
++     "non-Latin script is supported - searched in its own language"],
++]
++
++NOTES = [
++    ("name", "REQUIRED", "The person's name as you have it. Punctuation, "
++     "missing diacritics and initials variants are handled ('A.R. Rahman', "
++     "'AR Rahman', 'Beyonce'). Non-Latin scripts are searched in their own "
++     "language."),
++    ("role", "Strongly recommended", "The single most valuable field. Without "
++     "it, a shared name returns 'disambiguate' instead of an answer. You "
++     "usually already have it: title_category implies it."),
++    ("active_year", "Optional", "Year the person was relevant to this request. "
++     "Rules out candidates who were dead or unborn then."),
++    ("country", "Optional", "Country name or a Wikidata Q-id. Helps separate "
++     "same-name people in different markets."),
++    ("context", "Optional", "Show, brand or campaign. Recorded for audit; not "
++     "used for matching yet."),
++    ("client", "Optional", "Your account or brand set. Recorded for audit."),
++    ("row_id", "Optional", "Your own identifier, echoed back so you can join "
++     "the results to your source sheet. Auto-numbered if blank."),
++    ("notes", "Optional", "Free text, passed through to the output."),
++]
++
++DECISIONS = [
++    ("resolved", "One person matched on role. Handles in the platform columns "
++     "are accepted (confidence >= 0.75)."),
++    ("disambiguate", "Several people share this name and the role hint did not "
++     "separate them. The alternates column lists the candidates - pick one and "
++     "re-run that row with a tighter role or country."),
++    ("unverified_only", "No entity in the identity graph, so search proposals "
++     "only. UNVERIFIED - confirm before use. Common for micro-influencers."),
++    ("not_found", "No matching human found at all. Check the spelling against "
++     "the person's Wikipedia article."),
++    ("error", "Something failed on that row; see notes."),
++]
++
++
++def build_template_xlsx() -> bytes:
++    from openpyxl import Workbook
++    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
++    from openpyxl.utils import get_column_letter
++    from openpyxl.worksheet.datavalidation import DataValidation
++
++    NAVY = "16243F"
++    ACCENT = "33449C"
++    wb = Workbook()
++
++    head_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
++    head_fill = PatternFill("solid", fgColor=NAVY)
++    body = Font(name="Arial", size=10)
++    bold = Font(name="Arial", bold=True, size=10)
++    title = Font(name="Arial", bold=True, size=14, color=NAVY)
++    # yellow marks cells the user should fill in
++    input_fill = PatternFill("solid", fgColor="FFF9DB")
++    example_fill = PatternFill("solid", fgColor="EDF1F7")
++    example_font = Font(name="Arial", size=10, italic=True, color="5A6B87")
++    thin = Side(style="thin", color="D9E0EA")
++    box = Border(left=thin, right=thin, top=thin, bottom=thin)
++    wrap = Alignment(vertical="top", wrap_text=True)
++
++    # ---------------- Instructions ----------------
++    ws = wb.active
++    ws.title = "Instructions"
++    ws["A1"] = "Talent Social Media Finder - bulk upload template"
++    ws["A1"].font = title
++    ws["A3"] = ("Fill in the Input sheet, then upload it at "
++                "https://talent-social-finder.onrender.com")
++    ws["A3"].font = body
++    ws["A4"] = ("Delete the six grey example rows before uploading. Only "
++                "'name' is required; everything else improves accuracy.")
++    ws["A4"].font = body
++
++    ws["A6"] = "Columns"
++    ws["A6"].font = Font(name="Arial", bold=True, size=11, color=NAVY)
++    ws.append([])
++    r = 7
++    for c, label in enumerate(["Column", "Required?", "What it does"], start=1):
++        cell = ws.cell(row=r, column=c, value=label)
++        cell.font = head_font
++        cell.fill = head_fill
++        cell.alignment = wrap
++    for name, req, desc in NOTES:
++        r += 1
++        for c, val in enumerate([name, req, desc], start=1):
++            cell = ws.cell(row=r, column=c, value=val)
++            cell.font = bold if c == 1 else body
++            cell.alignment = wrap
++            cell.border = box
++
++    r += 3
++    ws.cell(row=r, column=1, value="What the decision column means").font = \
++        Font(name="Arial", bold=True, size=11, color=NAVY)
++    r += 1
++    for c, label in enumerate(["decision", "meaning"], start=1):
++        cell = ws.cell(row=r, column=c, value=label)
++        cell.font = head_font
++        cell.fill = head_fill
++        cell.alignment = wrap
++    for dec, meaning in DECISIONS:
++        r += 1
++        for c, val in enumerate([dec, meaning], start=1):
++            cell = ws.cell(row=r, column=c, value=val)
++            cell.font = bold if c == 1 else body
++            cell.alignment = wrap
++            cell.border = box
++
++    r += 3
++    ws.cell(row=r, column=1, value="Limits").font = \
++        Font(name="Arial", bold=True, size=11, color=NAVY)
++    for line in [
++        "A live run costs roughly 5-10 seconds per name, because upstream rate "
++        "limits are respected deliberately.",
++        "One upload processes rows under a ~75 second budget and returns the "
++        "rest as 'unprocessed'. Resubmit those; the cache makes pass two faster.",
++        "For a sheet of hundreds of names, upload in batches of about 20-30, or "
++        "run it locally where there is no HTTP timeout.",
++        "A name match alone never produces a handle. Rows without corroboration "
++        "come back as review or unverified, by design.",
++    ]:
++        r += 1
++        cell = ws.cell(row=r, column=1, value="- " + line)
++        cell.font = body
++        cell.alignment = wrap
++
++    ws.column_dimensions["A"].width = 22
++    ws.column_dimensions["B"].width = 22
++    ws.column_dimensions["C"].width = 86
++    for row in ws.iter_rows(min_row=3, max_row=r):
++        ws.row_dimensions[row[0].row].height = None
++
++    # ---------------- Input ----------------
++    inp = wb.create_sheet("Input")
++    inp.append(INPUT_COLUMNS)
++    for c in range(1, len(INPUT_COLUMNS) + 1):
++        cell = inp.cell(row=1, column=c)
++        cell.font = head_font
++        cell.fill = head_fill
++        cell.alignment = Alignment(vertical="center", wrap_text=True)
++
++    for ex in EXAMPLE_ROWS:
++        inp.append(ex)
++        for c in range(1, len(INPUT_COLUMNS) + 1):
++            cell = inp.cell(row=inp.max_row, column=c)
++            cell.font = example_font
++            cell.fill = example_fill
++            cell.border = box
++
++    # blank rows the operator fills in, marked yellow
++    for _ in range(40):
++        inp.append([""] * len(INPUT_COLUMNS))
++        for c in range(1, len(INPUT_COLUMNS) + 1):
++            cell = inp.cell(row=inp.max_row, column=c)
++            cell.font = body
++            cell.fill = input_fill
++            cell.border = box
++
++    roles = sorted(OCCUPATION_BUCKETS.keys())
++    dv = DataValidation(type="list", formula1='"' + ",".join(roles) + '"',
++                        allow_blank=True, showDropDown=False)
++    dv.error = "Pick a role from the list, or leave blank."
++    dv.prompt = "Optional but strongly recommended - it is what resolves collisions."
++    inp.add_data_validation(dv)
++    dv.add(f"C2:C{inp.max_row}")
++
++    widths = {"row_id": 9, "name": 26, "role": 15, "active_year": 12,
++              "country": 18, "context": 32, "client": 16, "notes": 44}
++    for i, col in enumerate(INPUT_COLUMNS, start=1):
++        inp.column_dimensions[get_column_letter(i)].width = widths.get(col, 16)
++    inp.freeze_panes = "B2"
++
++    # ---------------- Reference ----------------
++    ref = wb.create_sheet("Reference")
++    ref["A1"] = "Valid role values"
++    ref["A1"].font = Font(name="Arial", bold=True, size=11, color=NAVY)
++    ref["A2"] = "Use exactly these. Common synonyms are mapped automatically."
++    ref["A2"].font = body
++    r = 4
++    ref.cell(row=r, column=1, value="role").font = head_font
++    ref.cell(row=r, column=1).fill = head_fill
++    ref.cell(row=r, column=2, value="matches occupations like").font = head_font
++    ref.cell(row=r, column=2).fill = head_fill
++    hints = {
++        "actor": "actor, actress, film/TV/voice actor",
++        "director": "film director, producer",
++        "musician": "singer, composer, songwriter, rapper, band",
++        "athlete": "footballer, cricketer, basketball player",
++        "creator": "YouTuber, streamer, influencer, content creator",
++        "model": "model, fashion model",
++        "journalist": "journalist, news anchor",
++        "politician": "politician",
++        "writer": "author, novelist, screenwriter",
++        "executive": "CEO, founder, businessperson",
++        "comedian": "comedian, stand-up",
++        "chef": "chef, restaurateur",
++    }
++    for role in roles:
++        r += 1
++        ref.cell(row=r, column=1, value=role).font = bold
++        ref.cell(row=r, column=2, value=hints.get(role, "")).font = body
++        ref.cell(row=r, column=1).border = box
++        ref.cell(row=r, column=2).border = box
++
++    r += 3
++    ref.cell(row=r, column=1, value="Recognised country names").font = \
++        Font(name="Arial", bold=True, size=11, color=NAVY)
++    r += 1
++    ref.cell(row=r, column=1,
++             value="Any of these, or a raw Wikidata Q-id. "
++                   "Unrecognised values pass through unchanged.").font = body
++    r += 1
++    names = sorted({k.title() for k in COUNTRY_QIDS})
++    for i in range(0, len(names), 6):
++        r += 1
++        ref.cell(row=r, column=1, value=", ".join(names[i:i + 6])).font = body
++
++    r += 3
++    ref.cell(row=r, column=1, value="Output columns you will get back").font = \
++        Font(name="Arial", bold=True, size=11, color=NAVY)
++    r += 1
++    ref.cell(row=r, column=1, value=", ".join(OUTPUT_COLUMNS)).font = body
++    ref.cell(row=r, column=1).alignment = wrap
++
++    ref.column_dimensions["A"].width = 30
++    ref.column_dimensions["B"].width = 60
++
++    buf = io.BytesIO()
++    wb.save(buf)
++    return buf.getvalue()
++
++
++def build_template_csv() -> bytes:
++    import csv
++    buf = io.StringIO()
++    w = csv.writer(buf)
++    w.writerow(INPUT_COLUMNS)
++    for ex in EXAMPLE_ROWS:
++        w.writerow(ex)
++    return buf.getvalue().encode("utf-8-sig")
+diff --git a/requirements.txt b/requirements.txt
+index c428732..23c8196 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,4 @@
+ Flask==3.0.3
+ gunicorn==22.0.0
+ Unidecode==1.3.8
++openpyxl==3.1.5
+diff --git a/templates/index.html b/templates/index.html
+index 6b37d6a..7e1a526 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -136,6 +136,36 @@ td.v{font-family:"IBM Plex Mono",monospace;word-break:break-all}
+   border-radius:3px;font-size:14px}
+ footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
+   font-size:12.5px;color:var(--muted)}
++.tabs{display:flex;gap:2px;margin-top:-18px}
++.tab{padding:9px 18px;background:#E6EAF1;border:1px solid var(--rule);
++  border-bottom:0;border-radius:3px 3px 0 0;cursor:pointer;
++  font:500 13px "IBM Plex Sans",sans-serif;color:var(--ink-soft)}
++.tab[aria-selected="true"]{background:var(--card);color:var(--ink)}
++.panel.tabbed{margin-top:0;border-radius:0 3px 3px 3px}
++.drop{border:1px dashed var(--rule);border-radius:3px;padding:26px;
++  text-align:center;background:#FCFDFE}
++.drop.over{border-color:var(--structured);background:#F4F6FD}
++.drop p{margin:6px 0;color:var(--ink-soft);font-size:14px}
++.linkbtn{background:none;border:0;color:var(--structured);cursor:pointer;
++  padding:0;font:500 14px "IBM Plex Sans",sans-serif;text-decoration:underline}
++.counts{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
++.count{padding:6px 12px;border-radius:2px;font-family:"IBM Plex Mono",monospace;
++  font-size:12px;border:1px solid var(--rule);background:var(--card)}
++.count b{font-weight:500}
++.count.resolved{border-left:3px solid var(--accept)}
++.count.disambiguate,.count.unverified_only{border-left:3px solid var(--review)}
++.count.not_found,.count.error{border-left:3px solid var(--reject)}
++.scroll{overflow-x:auto;border:1px solid var(--rule);border-radius:3px}
++.scroll table{border:0;font-size:12.5px;min-width:1100px}
++.scroll td{white-space:nowrap;max-width:260px;overflow:hidden;
++  text-overflow:ellipsis;font-family:"IBM Plex Mono",monospace}
++.dec{font-family:"IBM Plex Mono",monospace;font-size:11px;padding:2px 7px;
++  border-radius:2px}
++.dec.resolved{background:#E4F2EC;color:var(--accept)}
++.dec.disambiguate,.dec.unverified_only{background:#FDF3E0;color:var(--review)}
++.dec.not_found,.dec.error{background:#FBECEB;color:var(--reject)}
++.warnbox{border-left:3px solid var(--review);background:#FDF9F0;padding:12px 16px;
++  border-radius:3px;font-size:13.5px;margin-top:12px}
+ .spin{display:inline-block;width:13px;height:13px;border:2px solid #fff;
+   border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;
+   vertical-align:-2px;margin-right:8px}
+@@ -156,7 +186,12 @@ footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
+ </header>
+ 
+ <main>
+-  <div class="panel">
++  <div class="tabs" role="tablist">
++    <button class="tab" id="tab-single" role="tab" aria-selected="true">Single name</button>
++    <button class="tab" id="tab-bulk" role="tab" aria-selected="false">Bulk upload</button>
++  </div>
++
++  <div class="panel tabbed" id="pane-single">
+     <div class="grid">
+       <div>
+         <label for="name">Name</label>
+@@ -186,6 +221,32 @@ footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
+       already implies it. Leave it unknown to see what happens on a collision.</p>
+   </div>
+ 
++  <div class="panel tabbed" id="pane-bulk" hidden>
++    <div class="drop" id="drop">
++      <p><strong>Drop a .xlsx or .csv here</strong>, or
++        <button class="linkbtn" id="pick">choose a file</button></p>
++      <input type="file" id="file" accept=".xlsx,.xlsm,.csv,.tsv" hidden>
++      <p id="fname" class="mono" style="font-size:13px"></p>
++      <p>Only a <code>name</code> column is required. Headers are matched
++         loosely — <code>Talent Name</code>, <code>Title</code> and
++         <code>title_category</code> all work.</p>
++    </div>
++    <div class="row2">
++      <div class="field">
++        <label for="maxrows">Max rows this run</label>
++        <input id="maxrows" value="25" inputmode="numeric">
++      </div>
++      <button id="btn-validate" style="background:#E6EAF1;color:var(--ink)">Check file only</button>
++      <button id="btn-bulk" disabled>Resolve all rows</button>
++    </div>
++    <p class="hint">Download the template:
++      <a href="/api/template.xlsx">Excel</a> ·
++      <a href="/api/template.csv">CSV</a>.
++      A live run costs roughly 5–10s per name because upstream rate limits are
++      respected, so keep batches small and resubmit what comes back as
++      unprocessed.</p>
++  </div>
++
+   <div id="out"></div>
+ 
+   <footer>
+@@ -320,6 +381,173 @@ async function run(){
+ }
+ $("#go").addEventListener("click", run);
+ $("#name").addEventListener("keydown", e => { if(e.key==="Enter") run(); });
++
++/* ---------------- bulk upload ---------------- */
++let chosen = null;
++
++function showTab(which){
++  const single = which === "single";
++  $("#tab-single").setAttribute("aria-selected", single);
++  $("#tab-bulk").setAttribute("aria-selected", !single);
++  $("#pane-single").hidden = !single;
++  $("#pane-bulk").hidden = single;
++  out.innerHTML = "";
++}
++$("#tab-single").addEventListener("click", () => showTab("single"));
++$("#tab-bulk").addEventListener("click", () => showTab("bulk"));
++
++const drop = $("#drop"), fileInput = $("#file");
++$("#pick").addEventListener("click", () => fileInput.click());
++fileInput.addEventListener("change", () => setFile(fileInput.files[0]));
++["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => {
++  e.preventDefault(); drop.classList.add("over"); }));
++["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => {
++  e.preventDefault(); drop.classList.remove("over"); }));
++drop.addEventListener("drop", e => setFile(e.dataTransfer.files[0]));
++
++function setFile(f){
++  if (!f) return;
++  chosen = f;
++  $("#fname").textContent = f.name + " · " + Math.ceil(f.size/1024) + " KB";
++  $("#btn-bulk").disabled = false;
++}
++
++async function post(url, form){
++  const r = await fetch(url, {method:"POST", body:form});
++  return {status:r.status, data: await r.json()};
++}
++
++function countsHtml(counts){
++  const keys = Object.keys(counts||{});
++  if (!keys.length) return "";
++  return '<div class="counts">' + keys.map(k =>
++    `<span class="count ${esc(k)}"><b>${counts[k]}</b> ${esc(k)}</span>`
++  ).join("") + "</div>";
++}
++
++function mapHtml(m){
++  const keys = Object.keys(m||{});
++  if (!keys.length) return "";
++  return `<table><thead><tr><th>your header</th><th>read as</th></tr></thead><tbody>`
++    + keys.map(k => `<tr><td class="k">${esc(k)}</td><td class="v">${esc(m[k])}</td></tr>`).join("")
++    + `</tbody></table>`;
++}
++
++async function validateFile(){
++  if (!chosen) return;
++  const btn = $("#btn-validate"); btn.disabled = true;
++  out.innerHTML = "";
++  try{
++    const fd = new FormData(); fd.append("file", chosen);
++    const {status, data} = await post("/api/bulk/validate", fd);
++    if (status >= 400){
++      out.innerHTML = `<section><div class="err"><strong>${esc(data.error)}</strong>
++        ${data.unmapped_headers && data.unmapped_headers.length
++          ? "<br>Unrecognised headers: " + esc(data.unmapped_headers.join(", ")) : ""}
++        </div></section>`;
++      return;
++    }
++    let h = `<section><div class="decision"><h2>File looks readable</h2>
++      <p>${data.valid_rows} rows with a name, ${data.without_role} of them with
++      no role hint.</p></div></section>`;
++    if (data.without_role > 0)
++      h += `<section><div class="warnbox">${data.without_role} row(s) have no
++        role. On a shared name those come back as <code>disambiguate</code>
++        rather than an answer — worth filling in first.</div></section>`;
++    if ((data.skipped_rows||[]).length)
++      h += `<section><div class="warnbox">${data.skipped_rows.length} row(s)
++        will be skipped (no name).</div></section>`;
++    h += `<section><h3>How your headers were read</h3>${mapHtml(data.header_map)}`;
++    if ((data.unmapped_headers||[]).length)
++      h += `<p class="hint">Ignored: ${esc(data.unmapped_headers.join(", "))}</p>`;
++    h += `</section>`;
++    if ((data.preview||[]).length){
++      h += `<section><h3>First rows</h3><div class="scroll"><table><thead><tr>
++        <th>row_id</th><th>name</th><th>role</th><th>year</th><th>country</th>
++        </tr></thead><tbody>` + data.preview.map(r =>
++        `<tr><td>${esc(r.row_id)}</td><td>${esc(r.name)}</td>
++             <td>${esc(r.role||"—")}</td><td>${esc(r.active_year||"—")}</td>
++             <td>${esc(r.country||"—")}</td></tr>`).join("")
++        + `</tbody></table></div></section>`;
++    }
++    out.innerHTML = h;
++  } finally { btn.disabled = false; }
++}
++
++let lastRows = null;
++
++async function runBulk(){
++  if (!chosen) return;
++  const btn = $("#btn-bulk"); btn.disabled = true;
++  const label = btn.textContent;
++  btn.innerHTML = '<span class="spin"></span>Resolving';
++  out.innerHTML = `<section><div class="decision"><h2>Working…</h2>
++    <p>Roughly 5–10 seconds per name in live mode. This page waits.</p>
++    </div></section>`;
++  try{
++    const fd = new FormData();
++    fd.append("file", chosen);
++    fd.append("max_rows", $("#maxrows").value || "25");
++    const {status, data} = await post("/api/bulk", fd);
++    if (status >= 400){
++      out.innerHTML = `<section><div class="err"><strong>${esc(data.error)}</strong></div></section>`;
++      return;
++    }
++    lastRows = data.rows || [];
++    let h = `<section><div class="decision"><h2>${data.processed} rows resolved</h2>
++      <p>${esc(data.mode)} mode · ${data.seconds}s${
++        data.stopped_because ? " · " + esc(data.stopped_because) : ""}</p>
++      </div>${countsHtml(data.decision_counts)}</section>`;
++
++    if ((data.unprocessed||[]).length)
++      h += `<section><div class="warnbox"><strong>${data.unprocessed.length}
++        row(s) not attempted.</strong> Re-upload a sheet containing just those
++        names — cached lookups make the second pass much faster.</div></section>`;
++    if ((data.skipped||[]).length)
++      h += `<section><div class="warnbox">${data.skipped.length} row(s) skipped
++        (no name).</div></section>`;
++
++    const cols = data.columns || [];
++    h += `<section><h3>Results</h3><div class="scroll"><table><thead><tr>`
++      + cols.map(c => `<th>${esc(c)}</th>`).join("")
++      + `</tr></thead><tbody>`
++      + lastRows.map(r => `<tr>` + cols.map(c => {
++          const v = r[c] ?? "";
++          if (c === "decision")
++            return `<td><span class="dec ${esc(v)}">${esc(v)}</span></td>`;
++          return `<td title="${esc(v)}">${esc(v)}</td>`;
++        }).join("") + `</tr>`).join("")
++      + `</tbody></table></div>
++        <div class="row2">
++          <button id="dl-xlsx">Download Excel</button>
++          <button id="dl-csv" style="background:#E6EAF1;color:var(--ink)">Download CSV</button>
++        </div></section>`;
++    out.innerHTML = h;
++    $("#dl-xlsx").addEventListener("click", () => download("xlsx"));
++    $("#dl-csv").addEventListener("click", () => download("csv"));
++  }catch(e){
++    out.innerHTML = `<section><div class="err"><strong>Upload failed.</strong><br>${esc(e.message)}</div></section>`;
++  }finally{
++    btn.disabled = false; btn.textContent = label;
++  }
++}
++
++async function download(fmt){
++  if (!lastRows) return;
++  const r = await fetch("/api/bulk/export", {
++    method:"POST", headers:{"Content-Type":"application/json"},
++    body: JSON.stringify({rows:lastRows, format:fmt})});
++  if (!r.ok) return;
++  const blob = await r.blob();
++  const a = document.createElement("a");
++  a.href = URL.createObjectURL(blob);
++  a.download = "talent-finder-results." + fmt;
++  document.body.appendChild(a); a.click(); a.remove();
++  URL.revokeObjectURL(a.href);
++}
++
++$("#btn-validate").addEventListener("click", validateFile);
++$("#btn-bulk").addEventListener("click", runBulk);
+ </script>
+ </body>
+ </html>
+diff --git a/tests/test_bulk.py b/tests/test_bulk.py
+new file mode 100644
+index 0000000..4e041a8
+--- /dev/null
++++ b/tests/test_bulk.py
+@@ -0,0 +1,235 @@
++"""Tests for bulk CSV/XLSX ingest. No network."""
++import csv
++import io
++import os
++import sys
++import time
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from identityforge.bulk import (INPUT_COLUMNS, OUTPUT_COLUMNS, canon_country,
++                                canon_header, canon_role, flatten_result,
++                                parse_csv, parse_upload, parse_xlsx, run_batch,
++                                to_csv, to_xlsx)
++from identityforge.template import build_template_csv, build_template_xlsx
++
++PASS = FAIL = 0
++
++
++def check(label, got, want):
++    global PASS, FAIL
++    if got == want:
++        PASS += 1
++        print(f"  ok   {label}")
++    else:
++        FAIL += 1
++        print(f"  FAIL {label}\n         got  {got!r}\n         want {want!r}")
++
++
++print("\n=== 1. Header aliasing (real sheets never use your names) ===")
++for raw, want in [
++    ("name", "name"), ("Name", "name"), ("Talent Name", "name"),
++    ("full_name", "name"), ("TITLE", "name"), ("Artist Name", "name"),
++    ("role", "role"), ("Title Category", "role"), ("title_category", "role"),
++    ("Occupation", "role"), ("active_year", "active_year"),
++    ("Campaign Year", "active_year"), ("Market", "country"),
++    ("Nationality", "country"), ("Show", "context"), ("Brand Set", "client"),
++    ("Sr. No.", "row_id"), ("row_id", "row_id"), ("TICKET-ID", "row_id"),
++    ("Remarks", "notes"),
++]:
++    check(f"{raw!r}", canon_header(raw), want)
++check("unknown header ignored", canon_header("Follower Count 2024"), None)
++check("blank header", canon_header("   "), None)
++check("None header", canon_header(None), None)
++
++print("\n=== 2. Value normalisation ===")
++check("singer -> musician", canon_role("Singer")[0], "musician")
++check("footballer -> athlete", canon_role("footballer")[0], "athlete")
++check("actress -> actor", canon_role("Actress")[0], "actor")
++check("influencer -> creator", canon_role("Influencer")[0], "creator")
++check("exact bucket kept", canon_role("director")[0], "director")
++check("blank role ok", canon_role("")[0], "")
++role, warn = canon_role("astronaut")
++check("unknown role dropped not guessed", role, "")
++check("unknown role warns", "unrecognised" in warn, True)
++
++check("India -> Q668", canon_country("India"), "Q668")
++check("USA -> Q30", canon_country("usa"), "Q30")
++check("UK -> Q145", canon_country("United Kingdom"), "Q145")
++check("raw qid passes through", canon_country("Q884"), "Q884")
++check("unknown country passes through", canon_country("Atlantis"), "Atlantis")
++check("blank country", canon_country(""), "")
++
++print("\n=== 3. CSV parsing ===")
++rows = [["Sr. No.", "Talent Name", "Title Category", "Campaign Year", "Market"],
++        ["T-1", "A.R. Rahman", "singer", "2010", "India"],
++        ["T-2", "", "actor", "2020", "India"],
++        ["T-3", "Christopher Nolan", "director", "not a year", "UK"]]
++buf = io.StringIO()
++csv.writer(buf).writerows(rows)
++p = parse_csv(buf.getvalue().encode())
++check("no errors", p.errors, [])
++check("headers mapped", p.header_map["Talent Name"], "name")
++check("valid rows", len(p.valid_rows), 2)
++check("empty name skipped", len(p.invalid_rows), 1)
++check("row_id preserved", p.valid_rows[0].row_id, "T-1")
++check("role normalised", p.valid_rows[0].role, "musician")
++check("country to qid", p.valid_rows[0].country, "Q668")
++check("bad year ignored with warning", p.valid_rows[1].active_year, None)
++check("year warning recorded",
++      any("active_year" in w for w in p.valid_rows[1].warnings), True)
++
++print("\n  -- semicolon delimiter (common in EU exports) --")
++p2 = parse_csv(b"name;role\nA.R. Rahman;singer\n")
++check("semicolons sniffed", len(p2.valid_rows), 1)
++check("value parsed", p2.valid_rows[0].role, "musician")
++
++print("\n  -- missing name column is a hard error, with the headers echoed --")
++p3 = parse_csv(b"foo,bar\n1,2\n")
++check("error raised", len(p3.errors), 1)
++check("error names the fix", "name" in p3.errors[0], True)
++check("error lists headers seen", "foo" in p3.errors[0], True)
++
++print("\n  -- encoding tolerance --")
++p4 = parse_csv("name\nBeyoncé\n".encode("utf-8-sig"))
++check("utf-8 BOM stripped", p4.valid_rows[0].name, "Beyoncé")
++p5 = parse_csv("name\nBeyoncé\n".encode("latin-1"))
++check("latin-1 fallback", len(p5.valid_rows), 1)
++check("blank file errors", len(parse_csv(b"").errors), 1)
++
++print("\n=== 4. XLSX parsing and template round-trip ===")
++tpl = build_template_xlsx()
++px = parse_xlsx(tpl)
++check("our own template parses", px.errors, [])
++check("Input sheet chosen", len(px.valid_rows), 6)
++check("example row intact", px.valid_rows[0].name, "A. R. Rahman")
++check("non-latin row survives",
++      any(not r.name.isascii() for r in px.valid_rows), True)
++check("template csv parses", parse_csv(build_template_csv()).errors, [])
++check("sniffs xlsx without extension", parse_upload("blob", tpl).errors, [])
++check("routes csv by extension",
++      parse_upload("x.csv", b"name\nFoo\n").valid_rows[0].name, "Foo")
++
++print("\n  -- a legend block above the header must not break it --")
++from openpyxl import Workbook
++wb = Workbook()
++ws = wb.active
++ws.append(["Talent list for Q3"])
++ws.append(["prepared by data ops"])
++ws.append([])
++ws.append(["name", "role"])
++ws.append(["A.R. Rahman", "singer"])
++b = io.BytesIO()
++wb.save(b)
++p6 = parse_xlsx(b.getvalue())
++check("header found below a title block", p6.errors, [])
++check("row read correctly", p6.valid_rows[0].name, "A.R. Rahman")
++
++print("\n=== 5. Batching under a budget ===")
++p7 = parse_csv(b"name\nA\nB\nC\nD\nE\n")
++check("five rows parsed", len(p7.valid_rows), 5)
++
++calls = []
++
++
++def fake_resolve(pr):
++    calls.append(pr.name)
++    return {"decision": "resolved", "entity_id": "Q1", "label": pr.name,
++            "roles": ["musician"], "coverage": 0.5,
++            "handles": {"instagram": [{"handle": pr.name.lower(),
++                                       "confidence": 0.9}]},
++            "external_ids": {"spotify_artist": "abc"}}
++
++
++b1 = run_batch(p7, fake_resolve, max_rows=3)
++check("max_rows respected", b1.processed, 3)
++check("overflow reported as unprocessed", len(b1.unprocessed), 2)
++check("unprocessed says why", "max_rows" in b1.unprocessed[0]["why"], True)
++
++
++def slow_resolve(pr):
++    time.sleep(0.12)
++    return {"decision": "resolved", "entity_id": "Q1", "label": pr.name,
++            "roles": [], "coverage": 0, "handles": {}, "external_ids": {}}
++
++
++b2 = run_batch(p7, slow_resolve, time_budget_seconds=0.2)
++check("budget stops the run early", b2.processed < 5, True)
++check("at least one row always attempted", b2.processed >= 1, True)
++check("stop reason recorded", "time budget" in b2.stopped_because, True)
++check("remainder returned", len(b2.unprocessed) > 0, True)
++
++
++def boom(pr):
++    raise RuntimeError("upstream exploded")
++
++
++b3 = run_batch(parse_csv(b"name\nA\nB\n"), boom)
++check("one bad row does not kill the batch", b3.processed, 2)
++check("error captured per row", b3.rows[0]["decision"], "error")
++check("error message kept", "exploded" in b3.rows[0]["notes"], True)
++
++print("\n=== 6. Output flattening ===")
++p8 = parse_csv(b"row_id,name\nR9,Michael Jackson\n")
++pr = p8.valid_rows[0]
++
++row = flatten_result(pr, {
++    "decision": "resolved", "entity_id": "Q2831", "label": "Michael Jackson",
++    "roles": ["musician"], "coverage": 0.75,
++    "handles": {"instagram": [{"handle": "mj", "confidence": 0.9}],
++                "wikipedia": [{"handle": "Michael Jackson", "lang": "en",
++                               "confidence": 0.8},
++                              {"handle": "\u30de\u30a4\u30b1\u30eb", "lang": "ja",
++                               "confidence": 0.8}]},
++    "needs_review": [{"platform": "youtube", "handle": "UCx",
++                      "confidence": 0.55}],
++    "external_ids": {"spotify_artist": "3fM", "imdb": "nm1"}})
++check("row_id echoed", row["row_id"], "R9")
++check("all output columns present", set(row.keys()), set(OUTPUT_COLUMNS))
++check("instagram handle placed", row["instagram"], "mj")
++check("multi-language wikipedia joined",
++      row["wikipedia"], "Michael Jackson (en) | \u30de\u30a4\u30b1\u30eb (ja)")
++check("review column carries confidence",
++      row["needs_review"], "youtube:UCx@0.55")
++check("spoke ids sorted and joined",
++      row["spoke_ids"], "imdb=nm1 | spotify_artist=3fM")
++
++row2 = flatten_result(pr, {"decision": "disambiguate",
++                           "reason": "top two too close",
++                           "cards": [{"entity_id": "Q1", "roles": ["musician"],
++                                      "description": "singer"},
++                                     {"entity_id": "Q2", "roles": ["athlete"],
++                                      "description": "footballer"}]})
++check("disambiguate lists alternates", "Q1:musician:singer" in row2["alternates"], True)
++check("disambiguate keeps reason", "too close" in row2["notes"], True)
++check("no handle invented on disambiguate", row2["instagram"], "")
++
++row3 = flatten_result(pr, {"decision": "unverified_only",
++                           "proposals": [{"platform": "instagram",
++                                          "handle": "guess1"}]})
++check("unverified proposals listed", "instagram:guess1" in row3["alternates"], True)
++check("unverified row is labelled UNVERIFIED", "UNVERIFIED" in row3["notes"], True)
++check("no handle column filled when unverified", row3["instagram"], "")
++
++row4 = flatten_result(pr, {"decision": "not_found"})
++check("not_found explained", "identity graph" in row4["notes"], True)
++
++print("\n=== 7. Writers ===")
++data = to_csv([row, row2])
++check("csv has BOM for Excel", data[:3], b"\xef\xbb\xbf")
++text = data.decode("utf-8-sig")
++check("csv header matches schema",
++      text.splitlines()[0], ",".join(OUTPUT_COLUMNS))
++check("csv row count", len(text.strip().splitlines()), 3)
++
++xb = to_xlsx([row, row2])
++check("xlsx is a zip", xb[:2], b"PK")
++from openpyxl import load_workbook
++ws2 = load_workbook(io.BytesIO(xb)).active
++check("xlsx sheet named", ws2.title, "Results")
++check("xlsx header written", [c.value for c in ws2[1]], OUTPUT_COLUMNS)
++check("xlsx data rows", ws2.max_row, 3)
++check("xlsx panes frozen", ws2.freeze_panes, "C2")
++
++print(f"\n{'='*54}\n  {PASS} passed, {FAIL} failed\n{'='*54}")
++sys.exit(1 if FAIL else 0)
+-- 
+2.43.0
+

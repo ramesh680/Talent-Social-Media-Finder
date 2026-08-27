@@ -31,6 +31,8 @@ node the person themselves attached their accounts to. Two consequences:
 | `providers.py` | TMDB person search that refuses to guess on a collision; OMDb title context. |
 | `discovery.py` | SerpAPI handle discovery. Proposals are Tier 5 — search can never auto-accept. |
 | `fetcher.py` | Cached, rate-limited, allowlisted HTTP with query-string secret redaction. |
+| `bulk.py` | CSV/XLSX ingest with tolerant header mapping, batching under a wall-clock budget, and CSV/XLSX writers. |
+| `template.py` | Generates the fill-in upload template (Instructions / Input / Reference sheets). |
 
 ## Evidence tiers
 
@@ -80,6 +82,59 @@ IF_LIVE=1 python app.py  # real Wikidata / TMDB / MusicBrainz / link-in-bio
 | `POST /api/classify` | `{urls:[...]}` → `(platform, handle)`. Handy on its own for cleaning handle columns |
 | `GET /api/audit` | P-number self-audit; validates against Wikidata in live mode |
 | `GET /api/health` | mode + version, used as Render's health check |
+
+## Bulk upload
+
+Download the template from the running app: `/api/template.xlsx` or
+`/api/template.csv`.
+
+**Only `name` is required.** Headers are matched loosely, so a sheet that came
+from a client or a Zendesk export usually works untouched — `Talent Name`,
+`Title`, `Full Name`, `Artist Name` all map to `name`; `Title Category` and
+`Occupation` map to `role`; `Sr. No.` and `TICKET-ID` map to `row_id`.
+
+| column | required | what it does |
+|---|---|---|
+| `name` | **yes** | Punctuation, diacritic and initials variants are handled. Non-Latin scripts are searched in their own language. |
+| `role` | strongly recommended | The single most valuable field — without it a shared name returns `disambiguate` instead of an answer. |
+| `active_year` | no | Rules out candidates dead or unborn at the time. |
+| `country` | no | Country name or a Wikidata Q-id. |
+| `context` | no | Show, brand or campaign. Recorded for audit. |
+| `client` | no | Account or brand set. Recorded for audit. |
+| `row_id` | no | Echoed back so you can join results to your source sheet. |
+| `notes` | no | Passed through. |
+
+Role synonyms are mapped (`singer`→musician, `footballer`→athlete,
+`actress`→actor, `influencer`→creator). An **unrecognised** role is dropped with
+a warning rather than guessed — a wrong role hint is worse than none, because it
+actively pushes the resolver at the wrong person.
+
+### Endpoints
+
+| route | does |
+|---|---|
+| `POST /api/bulk/validate` | Parse and report **without resolving**. Shows how each header was read and which rows will be skipped, before spending upstream quota. |
+| `POST /api/bulk` | Resolve. `max_rows` and `budget_seconds` form fields. |
+| `POST /api/bulk/export` | JSON rows back out as `.xlsx` or `.csv`. |
+
+### Why batches are small
+
+Live resolution costs roughly 5–10 seconds per name, because the rate limiter
+deliberately paces MusicBrainz at 1.1s and Wikidata at 0.4s. Against a 120s
+gunicorn timeout that is ~15–25 names per request, so `run_batch` works to a
+wall-clock budget and returns the rows it did not attempt instead of dying at
+row 14. Resubmit those; the HTTP cache makes the second pass much cheaper.
+
+For hundreds of names, run it locally where there is no HTTP timeout.
+
+### Output
+
+One row per input row, with the eight platform columns plus `decision`,
+`entity_id`, `coverage`, `needs_review`, `spoke_ids`, `alternates` and `notes`.
+Four decisions are visibly distinct: `resolved`, `disambiguate` (candidates in
+`alternates`), `unverified_only` (search proposals, confirm before use) and
+`not_found`. Platform columns stay **empty** unless a handle was actually
+accepted — a guess is never written into a handle column.
 
 ### Deploy to Render
 

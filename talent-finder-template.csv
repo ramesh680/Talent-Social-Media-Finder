@@ -1,0 +1,7 @@
+﻿row_id,name,role,active_year,country,context,client,notes
+1,A. R. Rahman,musician,2010,India,Slumdog Millionaire soundtrack,Sony Music,punctuation variant of the name is fine
+2,Michael Jackson,musician,2005,United States,Sony catalogue,Sony Music,same name as a footballer and a beer writer - role decides
+3,Michael Jackson,athlete,2000,United Kingdom,,,"same name, different person, different role hint"
+4,Christopher Nolan,director,2023,United Kingdom,Oppenheimer,Universal,
+5,Priyanka Chopra,actor,2022,India,Citadel,Prime Video,married name Priyanka Chopra Jonas also matches
+6,शाहरुख़ ख़ान,actor,2023,India,Jawan,,non-Latin script is supported - searched in its own language
