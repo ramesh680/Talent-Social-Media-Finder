@@ -1,0 +1,134 @@
+# Talent Social Media Finder (IdentityForge)
+
+Identity-anchor resolution for talent / influencer / celebrity social handles.
+Solves the same-name collision problem structurally rather than by fuzzy matching.
+
+## The one idea
+
+Stop resolving **names**. Resolve **identity anchors**.
+
+A name is a non-unique string, so no amount of scraping fixes it. An anchor is a
+node the person themselves attached their accounts to. Two consequences:
+
+- **Wikidata is the hub, every platform ID is a spoke.** Spotify artist ID, IMDb
+  `nm`, TMDB person, MusicBrainz MBID, Transfermarkt — all live as properties on
+  one Q-item, next to occupation and DOB. Resolve to a Q-item once, harvest every
+  spoke in one call. You never integrate 20 APIs pairwise.
+- **A link-in-bio page is a self-declared multi-platform cluster in one fetch.**
+  Nobody else's Linktree contains your Instagram, so one hit settles the collision.
+
+## Modules
+
+| file | role |
+|---|---|
+| `platforms.py` | URL → `(Platform, handle)` for the 8 targets. Strips tracking params, mobile subdomains, `twitter.com`→`x.com`; rejects `/p/`, `/watch`, `/tag/`, `/feed/` and other product routes that are not identities. |
+| `authorities.py` | The ID hub. 11 target authorities + 20 spoke authorities, each mapped to its Wikidata P-number. Occupation buckets and per-role anchor priority. |
+| `aggregators.py` | 22 link-in-bio domains, `__NEXT_DATA__` / `__NUXT__` / JSON-LD / anchor extractors, forward handle probing, reverse cascade, generic aggregator heuristic. |
+| `evidence.py` | 5-tier evidence model, diminishing-returns confidence, role-match scoring, `resolved` / `disambiguate` / `not_found` routing. |
+| `resolver.py` | Pipeline orchestration + SQLite entity store, collision registry and resolution log. |
+
+## Evidence tiers
+
+| tier | example | weight |
+|---|---|---|
+| 1 structured ID | Wikidata claim, TMDB `external_ids`, MusicBrainz url-rel | 0.55 |
+| 2 self-declared | Linktree, bio link, schema.org `sameAs` | 0.45 |
+| 3 bidirectional | A links to B **and** B links to A | 0.78 |
+| 4 corroborating | avatar hash, verified badge, shared domain | 0.15 |
+| 5 name match | string equality | **0.00** |
+
+Auto-accept ≥ 0.75, review ≥ 0.35. **A name match can never promote a claim** —
+that hard rule is the entire point of the tool.
+
+`Evidence.authoritative` marks the narrow set of sources where one hit is enough:
+a Wikidata sitelink (1:1 with the Q-item by construction) and a curated IMDb
+`nm`. Volunteer-added social handles are *not* authoritative — they go stale when
+someone rebrands, so they still want corroboration.
+
+## Design decisions worth knowing
+
+**`disambiguate` is a feature, not a failure.** When the top two candidates are
+within 0.25, the resolver refuses to guess and returns cards (photo, occupation,
+DOB, notable work, ID count). A human clicks in 3 seconds. That beats 20 minutes
+of searching *and* beats a silently wrong handle in a client deliverable.
+
+**All network I/O is injected** as one `fetch(url, kind)` callable. Rate limiting,
+caching, retries and user-agent policy live in one place, and the whole package is
+unit-testable offline.
+
+**Nine P-numbers are flagged unverified.** Run `authorities.unverified_properties()`
+at startup and log it; a wrong P-number returns nothing *silently*. `validate_property_map(fetch_json)`
+confirms each against the Wikidata API in batches of 40.
+
+## Run it
+
+```bash
+pip install -r requirements.txt
+python app.py            # http://localhost:8020  (demo mode, zero network)
+IF_LIVE=1 python app.py  # real Wikidata / TMDB / MusicBrainz / link-in-bio
+```
+
+| route | does |
+|---|---|
+| `GET /` | UI: name + role + year in, tier ledger out |
+| `POST /api/resolve` | `{name, role, active_year, context}` → handles + provenance |
+| `POST /api/classify` | `{urls:[...]}` → `(platform, handle)`. Handy on its own for cleaning handle columns |
+| `GET /api/audit` | P-number self-audit; validates against Wikidata in live mode |
+| `GET /api/health` | mode + version, used as Render's health check |
+
+### Deploy to Render
+
+`render.yaml` is a blueprint — point Render at the repo and it reads it. Free plan,
+`gunicorn`, health check on `/api/health`, **demo mode by default** so a public URL
+never fires outbound requests until you deliberately set `IF_LIVE=1`.
+
+Set `TMDB_API_KEY` in the Render dashboard, never in the repo.
+
+**Render's free tier has an ephemeral filesystem.** The SQLite entity store and
+HTTP cache live in `/tmp` and are wiped on every deploy and cold start. That is
+fine for evaluation, but the compounding entity store — the thing that stops you
+researching the same ambiguous name twice — only compounds with a persistent
+disk or Postgres. Budget for that before relying on it.
+
+## Usage
+
+```python
+from identityforge import Intake, EntityStore, resolve
+
+store = EntityStore("identityforge.db")
+result = resolve(
+    Intake(name="Michael Jackson", expected_role="musician",
+           active_year=2005, context="Sony Music catalogue"),
+    fetch=my_cached_fetcher, store=store, tmdb_key=TMDB_KEY)
+
+if result["decision"] == "disambiguate":
+    render_cards(result["cards"])       # human picks
+else:
+    result["handles"]        # accepted, per platform, with provenance
+    result["needs_review"]   # 0.35-0.75, one click to confirm
+    result["external_ids"]   # spotify/musicbrainz/tmdb/... for free
+```
+
+## Verification status
+
+68/68 offline tests pass, including the full Michael Jackson collision
+(singer / footballer / beer writer) end to end against fixtures.
+
+**Not yet verified against live endpoints** — this container can only reach
+PyPI/GitHub, so no request has actually hit Wikidata, Linktree, TMDB or
+MusicBrainz. Before trusting it: run the P-number audit, confirm the SPARQL query
+returns on a real endpoint (`rdfs:label|skos:altLabel` with a bare `"name"@en`
+match is exact and case-sensitive — you will likely need to add a normalised
+label fallback), and confirm the Linktree `__NEXT_DATA__` shape still holds.
+
+## Phase 2 candidates
+
+1. **Live validation + `fetch` adapter** with caching, backoff, robots/ToS policy.
+2. **Avatar perceptual hashing** — Tier 4, and unusually decisive in practice.
+3. **Transliteration for label matching** — you already hit this on the ~5k talent
+   reconciliation; Devanagari/Latin variants of the same name need to collapse to
+   one candidate set before role scoring runs.
+4. **Handle-permutation probing** for people with no Wikidata item at all — the
+   long tail of micro-influencers, where the forward probe path carries the load.
+5. **TitleForge integration**: `title_category` / `title_sub_category` already
+   imply a role bucket, so intake hints come free from data you hold.

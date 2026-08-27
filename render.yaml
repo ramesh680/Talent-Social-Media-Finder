@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: talent-social-finder
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    healthCheckPath: /api/health
+    envVars:
+      # Demo mode by default. Set IF_LIVE=1 in the Render dashboard only once
+      # you have reviewed the rate-limiting policy in identityforge/fetcher.py.
+      - key: IF_LIVE
+        value: "0"
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      # Set in the dashboard, never in this file.
+      - key: TMDB_API_KEY
+        sync: false
+      # Render's free tier has an ephemeral filesystem: the SQLite entity store
+      # and HTTP cache are wiped on every deploy and on cold start. Fine for
+      # evaluation. For the compounding entity store to actually compound,
+      # attach a disk (paid) or point these at Postgres.
+      - key: IF_DB_PATH
+        value: "/tmp/identityforge.db"
+      - key: IF_CACHE_PATH
+        value: "/tmp/http_cache.db"

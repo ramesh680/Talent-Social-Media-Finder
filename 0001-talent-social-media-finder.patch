@@ -1,0 +1,2833 @@
+From 21043f0fdfe7343e354b73d6d220596eb7e0b57a Mon Sep 17 00:00:00 2001
+From: Ramesh Goswami <ramesh@listenfirstmedia.com>
+Date: Thu, 27 Aug 2026 11:02:24 +0000
+Subject: [PATCH] Talent Social Media Finder: identity-anchor resolver + Flask
+ service
+
+Resolves talent/influencer social handles by identity anchor rather than by
+name string, which is what makes same-name collisions tractable.
+
+- platforms.py    URL -> (platform, handle) for FB/IG/X/YT/Wikipedia/IMDb/TikTok/LinkedIn
+- authorities.py  31 authorities mapped to Wikidata P-numbers (hub-and-spoke)
+- aggregators.py  22 link-in-bio hosts, __NEXT_DATA__/JSON-LD extractors, reverse cascade
+- evidence.py     5-tier evidence model; a name match alone can never resolve
+- resolver.py     pipeline + SQLite entity store, collision registry, provenance
+- fetcher.py      cached, rate-limited, allowlisted HTTP adapter
+- app.py          Flask service, demo mode by default
+
+68/68 offline tests pass. Not yet verified against live endpoints.
+---
+ .gitignore                   |   7 +
+ Procfile                     |   1 +
+ README.md                    | 134 ++++++++++
+ app.py                       | 198 ++++++++++++++
+ identityforge/__init__.py    |   8 +
+ identityforge/aggregators.py | 226 ++++++++++++++++
+ identityforge/authorities.py | 249 ++++++++++++++++++
+ identityforge/evidence.py    | 202 ++++++++++++++
+ identityforge/fetcher.py     | 248 ++++++++++++++++++
+ identityforge/platforms.py   | 275 +++++++++++++++++++
+ identityforge/resolver.py    | 496 +++++++++++++++++++++++++++++++++++
+ render.yaml                  |  26 ++
+ requirements.txt             |   2 +
+ runtime.txt                  |   1 +
+ templates/index.html         | 325 +++++++++++++++++++++++
+ tests/test_all.py            | 283 ++++++++++++++++++++
+ 16 files changed, 2681 insertions(+)
+ create mode 100644 .gitignore
+ create mode 100644 Procfile
+ create mode 100644 README.md
+ create mode 100644 app.py
+ create mode 100644 identityforge/__init__.py
+ create mode 100644 identityforge/aggregators.py
+ create mode 100644 identityforge/authorities.py
+ create mode 100644 identityforge/evidence.py
+ create mode 100644 identityforge/fetcher.py
+ create mode 100644 identityforge/platforms.py
+ create mode 100644 identityforge/resolver.py
+ create mode 100644 render.yaml
+ create mode 100644 requirements.txt
+ create mode 100644 runtime.txt
+ create mode 100644 templates/index.html
+ create mode 100644 tests/test_all.py
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..aeaef34
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,7 @@
++__pycache__/
++*.py[cod]
++*.db
++.env
++.venv/
++venv/
++.DS_Store
+diff --git a/Procfile b/Procfile
+new file mode 100644
+index 0000000..ecad5ca
+--- /dev/null
++++ b/Procfile
+@@ -0,0 +1 @@
++web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..8fdb6ed
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,134 @@
++# Talent Social Media Finder (IdentityForge)
++
++Identity-anchor resolution for talent / influencer / celebrity social handles.
++Solves the same-name collision problem structurally rather than by fuzzy matching.
++
++## The one idea
++
++Stop resolving **names**. Resolve **identity anchors**.
++
++A name is a non-unique string, so no amount of scraping fixes it. An anchor is a
++node the person themselves attached their accounts to. Two consequences:
++
++- **Wikidata is the hub, every platform ID is a spoke.** Spotify artist ID, IMDb
++  `nm`, TMDB person, MusicBrainz MBID, Transfermarkt — all live as properties on
++  one Q-item, next to occupation and DOB. Resolve to a Q-item once, harvest every
++  spoke in one call. You never integrate 20 APIs pairwise.
++- **A link-in-bio page is a self-declared multi-platform cluster in one fetch.**
++  Nobody else's Linktree contains your Instagram, so one hit settles the collision.
++
++## Modules
++
++| file | role |
++|---|---|
++| `platforms.py` | URL → `(Platform, handle)` for the 8 targets. Strips tracking params, mobile subdomains, `twitter.com`→`x.com`; rejects `/p/`, `/watch`, `/tag/`, `/feed/` and other product routes that are not identities. |
++| `authorities.py` | The ID hub. 11 target authorities + 20 spoke authorities, each mapped to its Wikidata P-number. Occupation buckets and per-role anchor priority. |
++| `aggregators.py` | 22 link-in-bio domains, `__NEXT_DATA__` / `__NUXT__` / JSON-LD / anchor extractors, forward handle probing, reverse cascade, generic aggregator heuristic. |
++| `evidence.py` | 5-tier evidence model, diminishing-returns confidence, role-match scoring, `resolved` / `disambiguate` / `not_found` routing. |
++| `resolver.py` | Pipeline orchestration + SQLite entity store, collision registry and resolution log. |
++
++## Evidence tiers
++
++| tier | example | weight |
++|---|---|---|
++| 1 structured ID | Wikidata claim, TMDB `external_ids`, MusicBrainz url-rel | 0.55 |
++| 2 self-declared | Linktree, bio link, schema.org `sameAs` | 0.45 |
++| 3 bidirectional | A links to B **and** B links to A | 0.78 |
++| 4 corroborating | avatar hash, verified badge, shared domain | 0.15 |
++| 5 name match | string equality | **0.00** |
++
++Auto-accept ≥ 0.75, review ≥ 0.35. **A name match can never promote a claim** —
++that hard rule is the entire point of the tool.
++
++`Evidence.authoritative` marks the narrow set of sources where one hit is enough:
++a Wikidata sitelink (1:1 with the Q-item by construction) and a curated IMDb
++`nm`. Volunteer-added social handles are *not* authoritative — they go stale when
++someone rebrands, so they still want corroboration.
++
++## Design decisions worth knowing
++
++**`disambiguate` is a feature, not a failure.** When the top two candidates are
++within 0.25, the resolver refuses to guess and returns cards (photo, occupation,
++DOB, notable work, ID count). A human clicks in 3 seconds. That beats 20 minutes
++of searching *and* beats a silently wrong handle in a client deliverable.
++
++**All network I/O is injected** as one `fetch(url, kind)` callable. Rate limiting,
++caching, retries and user-agent policy live in one place, and the whole package is
++unit-testable offline.
++
++**Nine P-numbers are flagged unverified.** Run `authorities.unverified_properties()`
++at startup and log it; a wrong P-number returns nothing *silently*. `validate_property_map(fetch_json)`
++confirms each against the Wikidata API in batches of 40.
++
++## Run it
++
++```bash
++pip install -r requirements.txt
++python app.py            # http://localhost:8020  (demo mode, zero network)
++IF_LIVE=1 python app.py  # real Wikidata / TMDB / MusicBrainz / link-in-bio
++```
++
++| route | does |
++|---|---|
++| `GET /` | UI: name + role + year in, tier ledger out |
++| `POST /api/resolve` | `{name, role, active_year, context}` → handles + provenance |
++| `POST /api/classify` | `{urls:[...]}` → `(platform, handle)`. Handy on its own for cleaning handle columns |
++| `GET /api/audit` | P-number self-audit; validates against Wikidata in live mode |
++| `GET /api/health` | mode + version, used as Render's health check |
++
++### Deploy to Render
++
++`render.yaml` is a blueprint — point Render at the repo and it reads it. Free plan,
++`gunicorn`, health check on `/api/health`, **demo mode by default** so a public URL
++never fires outbound requests until you deliberately set `IF_LIVE=1`.
++
++Set `TMDB_API_KEY` in the Render dashboard, never in the repo.
++
++**Render's free tier has an ephemeral filesystem.** The SQLite entity store and
++HTTP cache live in `/tmp` and are wiped on every deploy and cold start. That is
++fine for evaluation, but the compounding entity store — the thing that stops you
++researching the same ambiguous name twice — only compounds with a persistent
++disk or Postgres. Budget for that before relying on it.
++
++## Usage
++
++```python
++from identityforge import Intake, EntityStore, resolve
++
++store = EntityStore("identityforge.db")
++result = resolve(
++    Intake(name="Michael Jackson", expected_role="musician",
++           active_year=2005, context="Sony Music catalogue"),
++    fetch=my_cached_fetcher, store=store, tmdb_key=TMDB_KEY)
++
++if result["decision"] == "disambiguate":
++    render_cards(result["cards"])       # human picks
++else:
++    result["handles"]        # accepted, per platform, with provenance
++    result["needs_review"]   # 0.35-0.75, one click to confirm
++    result["external_ids"]   # spotify/musicbrainz/tmdb/... for free
++```
++
++## Verification status
++
++68/68 offline tests pass, including the full Michael Jackson collision
++(singer / footballer / beer writer) end to end against fixtures.
++
++**Not yet verified against live endpoints** — this container can only reach
++PyPI/GitHub, so no request has actually hit Wikidata, Linktree, TMDB or
++MusicBrainz. Before trusting it: run the P-number audit, confirm the SPARQL query
++returns on a real endpoint (`rdfs:label|skos:altLabel` with a bare `"name"@en`
++match is exact and case-sensitive — you will likely need to add a normalised
++label fallback), and confirm the Linktree `__NEXT_DATA__` shape still holds.
++
++## Phase 2 candidates
++
++1. **Live validation + `fetch` adapter** with caching, backoff, robots/ToS policy.
++2. **Avatar perceptual hashing** — Tier 4, and unusually decisive in practice.
++3. **Transliteration for label matching** — you already hit this on the ~5k talent
++   reconciliation; Devanagari/Latin variants of the same name need to collapse to
++   one candidate set before role scoring runs.
++4. **Handle-permutation probing** for people with no Wikidata item at all — the
++   long tail of micro-influencers, where the forward probe path carries the load.
++5. **TitleForge integration**: `title_category` / `title_sub_category` already
++   imply a role bucket, so intake hints come free from data you hold.
+diff --git a/app.py b/app.py
+new file mode 100644
+index 0000000..9021b8c
+--- /dev/null
++++ b/app.py
+@@ -0,0 +1,198 @@
++"""
++IdentityForge web service.
++
++Two modes, chosen by the IF_LIVE env var:
++
++  demo (default)  fixtures only, zero outbound requests. Safe for a public URL,
++                  survives Render cold starts, and lets you show the workflow
++                  without exposing keys or hammering Wikidata.
++  live (IF_LIVE=1) real Wikidata / TMDB / MusicBrainz / link-in-bio fetches
++                  through CachedFetcher, with rate limiting and a domain
++                  allowlist.
++
++Deliberately read-only. Nothing here writes to a client system, posts anywhere,
++or takes a credential in a query string.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from flask import Flask, jsonify, render_template, request
++
++from identityforge import authorities
++from identityforge.authorities import OCCUPATION_BUCKETS
++from identityforge.fetcher import CachedFetcher, FixtureFetcher, build_fetcher
++from identityforge.resolver import EntityStore, Intake, resolve
++
++app = Flask(__name__)
++
++LIVE = os.environ.get("IF_LIVE", "0") == "1"
++TMDB_KEY = os.environ.get("TMDB_API_KEY", "")
++DB_PATH = os.environ.get("IF_DB_PATH", "identityforge.db")
++
++_store = EntityStore(DB_PATH)
++_live_fetcher: CachedFetcher | None = None
++
++
++# ---------------------------------------------------------------------------
++# demo fixtures - the Michael Jackson collision, which is a real one
++# ---------------------------------------------------------------------------
++
++_LINKTREE = """<html><script id="__NEXT_DATA__" type="application/json">
++%s
++</script></html>""" % json.dumps({"props": {"pageProps": {"links": [
++    {"url": "https://instagram.com/michaeljackson?igshid=x"},
++    {"url": "https://twitter.com/michaeljackson"},
++    {"url": "https://www.youtube.com/@michaeljackson"},
++    {"url": "https://www.facebook.com/michaeljackson"},
++    {"url": "https://www.tiktok.com/@michaeljackson"},
++    {"url": "https://ffm.to/thriller"},
++]}}})
++
++DEMO_FIXTURES: dict[str, object] = {
++    "sparql": {"results": {"bindings": [
++        {"p": {"value": "http://www.wikidata.org/entity/Q2831"},
++         "pLabel": {"value": "Michael Jackson"},
++         "pDesc": {"value": "American singer, songwriter and dancer (1958-2009)"},
++         "occ": {"value": "http://www.wikidata.org/entity/Q177220"},
++         "dob": {"value": "1958-08-29T00:00:00Z"},
++         "dod": {"value": "2009-06-25T00:00:00Z"}},
++        {"p": {"value": "http://www.wikidata.org/entity/Q6831397"},
++         "pLabel": {"value": "Michael Jackson"},
++         "pDesc": {"value": "English footballer"},
++         "occ": {"value": "http://www.wikidata.org/entity/Q937857"},
++         "dob": {"value": "1973-01-01T00:00:00Z"}},
++        {"p": {"value": "http://www.wikidata.org/entity/Q1928447"},
++         "pLabel": {"value": "Michael Jackson"},
++         "pDesc": {"value": "British writer on beer and whisky (1942-2007)"},
++         "occ": {"value": "http://www.wikidata.org/entity/Q36180"},
++         "dob": {"value": "1942-03-27T00:00:00Z"},
++         "dod": {"value": "2007-08-30T00:00:00Z"}},
++    ]}},
++    "wbgetentities": {"entities": {"Q2831": {
++        "claims": {
++            "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++            "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++            "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
++            "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
++            "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
++            "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
++            "P2397": [{"mainsnak": {"datavalue": {"value": "UCoUM-UJ7rirJYP8CQ0EIaHA"}}}],
++        },
++        "sitelinks": {"enwiki": {"title": "Michael Jackson"},
++                      "hiwiki": {"title": "\u092e\u093e\u0907\u0915\u0932 \u091c\u0948\u0915\u094d\u0938\u0928"},
++                      "jawiki": {"title": "\u30de\u30a4\u30b1\u30eb\u30fb\u30b8\u30e3\u30af\u30bd\u30f3"}},
++    }}},
++    "musicbrainz.org/ws": {"relations": [
++        {"type": "social network",
++         "url": {"resource": "https://www.tiktok.com/@michaeljackson"}},
++        {"type": "social network",
++         "url": {"resource": "https://www.facebook.com/michaeljackson"}},
++    ]},
++    "instagram.com": '<html><a href="https://linktr.ee/michaeljackson">links</a></html>',
++    "linktr.ee": _LINKTREE,
++}
++
++
++def _fetcher():
++    global _live_fetcher
++    if not LIVE:
++        return FixtureFetcher(DEMO_FIXTURES)
++    if _live_fetcher is None:
++        _live_fetcher = build_fetcher()
++    return _live_fetcher
++
++
++# ---------------------------------------------------------------------------
++# routes
++# ---------------------------------------------------------------------------
++
++@app.get("/")
++def index():
++    return render_template("index.html", live=LIVE,
++                           roles=sorted(OCCUPATION_BUCKETS.keys()))
++
++
++@app.get("/api/health")
++def health():
++    return jsonify({"ok": True, "mode": "live" if LIVE else "demo",
++                    "tmdb_key_present": bool(TMDB_KEY),
++                    "version": "0.2.0"})
++
++
++@app.get("/api/audit")
++def audit():
++    """P-number self-audit. Unverified properties fail SILENTLY in production,
++    so this endpoint exists to make that failure loud."""
++    unver = [{"property": a.wikidata_prop, "key": a.key, "notes": a.notes}
++             for a in authorities.unverified_properties()]
++    payload = {"unverified_count": len(unver), "unverified": unver,
++               "validated": None}
++    if LIVE:
++        f = _fetcher()
++        payload["validated"] = authorities.validate_property_map(
++            lambda u: f(u, kind="json"))
++    return jsonify(payload)
++
++
++@app.post("/api/resolve")
++def api_resolve():
++    body = request.get_json(silent=True) or {}
++    name = (body.get("name") or "").strip()
++    if not name:
++        return jsonify({"error": "Enter a name to resolve."}), 400
++    if len(name) > 120:
++        return jsonify({"error": "Name is too long."}), 400
++
++    role = (body.get("role") or "").strip() or None
++    if role and role not in OCCUPATION_BUCKETS:
++        return jsonify({"error": f"Unknown role: {role}"}), 400
++
++    year = body.get("active_year")
++    try:
++        year = int(year) if year not in (None, "") else None
++    except (TypeError, ValueError):
++        year = None
++
++    intake = Intake(name=name, expected_role=role, active_year=year,
++                    context=(body.get("context") or "").strip(),
++                    client=(body.get("client") or "").strip())
++
++    fetch = _fetcher()
++    try:
++        result = resolve(intake, fetch, _store, tmdb_key=TMDB_KEY,
++                         do_bidirectional=bool(body.get("bidirectional")))
++    except Exception as exc:                                  # noqa: BLE001
++        return jsonify({"error": "Resolution failed.",
++                        "detail": str(exc)[:300]}), 502
++
++    result["mode"] = "live" if LIVE else "demo"
++    if isinstance(fetch, CachedFetcher):
++        result["fetch_stats"] = fetch.stats.as_dict()
++        fetch.reset_stats()
++    else:
++        result["fetch_stats"] = {"fixture_calls": len(fetch.calls)}
++    return jsonify(result)
++
++
++@app.post("/api/classify")
++def api_classify():
++    """Paste any URL, get (platform, handle). Useful on its own for cleaning
++    handle columns in a spreadsheet."""
++    from identityforge import classify_url
++    urls = (request.get_json(silent=True) or {}).get("urls") or []
++    out = []
++    for u in urls[:200]:
++        ref = classify_url(u)
++        out.append({"input": u,
++                    "platform": ref.platform.value if ref else None,
++                    "handle": ref.handle if ref else None,
++                    "lang": ref.lang if ref else None,
++                    "id_kind": ref.id_kind if ref else None,
++                    "canonical_url": ref.canonical_url if ref else None})
++    return jsonify({"results": out})
++
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8020)), debug=False)
+diff --git a/identityforge/__init__.py b/identityforge/__init__.py
+new file mode 100644
+index 0000000..3575a56
+--- /dev/null
++++ b/identityforge/__init__.py
+@@ -0,0 +1,8 @@
++"""IdentityForge - identity-anchor resolution for talent/influencer/celebrity data."""
++from .platforms import Platform, PlatformRef, classify_url, build_url, TARGET_PLATFORMS
++from .aggregators import harvest, probe_urls, is_aggregator_url, looks_like_aggregator
++from .evidence import Tier, Evidence, HandleClaim, Candidate, rank, score_role_match
++from .resolver import Intake, EntityStore, resolve
++from . import authorities
++
++__version__ = "0.1.0"
+diff --git a/identityforge/aggregators.py b/identityforge/aggregators.py
+new file mode 100644
+index 0000000..e4042c3
+--- /dev/null
++++ b/identityforge/aggregators.py
+@@ -0,0 +1,226 @@
++"""
++Link-in-bio layer.
++
++Why this matters: an aggregator page is a SELF-DECLARED, MULTI-PLATFORM cluster
++in a single HTTP fetch. One hit gives you 5-8 platforms at once, and it is
++authored by the person, so it settles same-name collisions outright - nobody
++else's Linktree contains your Instagram.
++
++Two directions of travel, both implemented here:
++
++  FORWARD  candidate handle -> probe {domain}/{handle} across ~18 aggregators
++  REVERSE  one confirmed profile -> its bio link -> aggregator -> harvest all
++
++REVERSE is the high-value path and is where you should spend your fetch budget.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import dataclass, field
++from typing import Iterable, Optional
++from urllib.parse import urlsplit
++
++from .platforms import PlatformRef, classify_url
++
++
++@dataclass(frozen=True)
++class Aggregator:
++    domain: str
++    name: str
++    slug_in_path: bool = True      # linktr.ee/foo  vs  foo.carrd.co
++    extractor: str = "next_data"   # next_data | nuxt | jsonld | anchors
++    notes: str = ""
++
++
++AGGREGATORS: list[Aggregator] = [
++    Aggregator("linktr.ee", "Linktree", extractor="next_data",
++               notes="__NEXT_DATA__ script tag holds every link as JSON - parse "
++                     "that, never the DOM"),
++    Aggregator("beacons.ai", "Beacons", extractor="next_data"),
++    Aggregator("bio.link", "Bio.link", extractor="next_data"),
++    Aggregator("allmylinks.com", "AllMyLinks", extractor="anchors",
++               notes="plain server-rendered anchors; very high link density"),
++    Aggregator("solo.to", "Solo.to", extractor="anchors"),
++    Aggregator("taplink.cc", "Taplink", extractor="anchors"),
++    Aggregator("linkr.bio", "Linkr", extractor="anchors"),
++    Aggregator("lnk.bio", "Lnk.Bio", extractor="anchors"),
++    Aggregator("linkin.bio", "Later Linkin.bio", extractor="anchors"),
++    Aggregator("komi.io", "Komi", extractor="next_data",
++               notes="talent-agency heavy - great for actors/musicians"),
++    Aggregator("hoo.be", "hoo.be", extractor="next_data",
++               notes="skews to A-list talent and athletes"),
++    Aggregator("stan.store", "Stan", extractor="next_data",
++               notes="creator-commerce; skews to influencers not celebrities"),
++    Aggregator("direct.me", "Direct.me", extractor="anchors"),
++    Aggregator("shorby.com", "Shorby", extractor="anchors"),
++    Aggregator("campsite.bio", "Campsite", extractor="anchors"),
++    Aggregator("flowcode.com", "Flowpage", extractor="anchors"),
++    Aggregator("znap.link", "Znap", extractor="anchors"),
++    Aggregator("carrd.co", "Carrd", slug_in_path=False, extractor="anchors"),
++    Aggregator("about.me", "About.me", extractor="jsonld"),
++    Aggregator("milkshake.app", "Milkshake", extractor="anchors"),
++    Aggregator("tap.bio", "Tap.bio", extractor="anchors"),
++    Aggregator("withkoji.com", "Koji", extractor="next_data",
++               notes="largely wound down - keep for historic links"),
++]
++
++AGGREGATOR_DOMAINS = {a.domain: a for a in AGGREGATORS}
++
++# music-industry smart links: not identity anchors themselves, but they very
++# often sit next to one and confirm the music vertical.
++SMARTLINK_DOMAINS = {
++    "ffm.to", "found.ee", "smarturl.it", "lnk.to", "distrokid.com",
++    "orcd.co", "backl.ink", "push.fm", "hypeddit.com", "toneden.io",
++    "songwhip.com", "album.link", "song.link", "li.sten.to",
++}
++
++
++def is_aggregator_url(url: str) -> Optional[Aggregator]:
++    host = (urlsplit(url if "://" in url else "https://" + url).hostname or "").lower()
++    host = host.removeprefix("www.")
++    if host in AGGREGATOR_DOMAINS:
++        return AGGREGATOR_DOMAINS[host]
++    # subdomain forms: foo.carrd.co, foo.milkshake.app
++    for dom, agg in AGGREGATOR_DOMAINS.items():
++        if host.endswith("." + dom):
++            return agg
++    return None
++
++
++def probe_urls(handle: str) -> list[str]:
++    """FORWARD probe: candidate urls to HEAD/GET for a given handle."""
++    h = handle.lstrip("@").strip()
++    if not h or not re.fullmatch(r"[A-Za-z0-9._\-]{2,40}", h):
++        return []
++    out = []
++    for agg in AGGREGATORS:
++        if agg.slug_in_path:
++            out.append(f"https://{agg.domain}/{h}")
++        else:
++            out.append(f"https://{h}.{agg.domain}")
++    return out
++
++
++# ---------------------------------------------------------------------------
++# extraction
++# ---------------------------------------------------------------------------
++
++_NEXT_DATA_RE = re.compile(
++    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
++    re.S | re.I)
++_NUXT_RE = re.compile(r"window\.__NUXT__\s*=\s*(\{.*?\});?\s*</script>", re.S)
++_JSONLD_RE = re.compile(
++    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
++    re.S | re.I)
++_HREF_RE = re.compile(r'href=["\'](https?://[^"\'<>\s]+)["\']', re.I)
++_BARE_URL_RE = re.compile(r'https?://[A-Za-z0-9./_%\-@?=&#:]+')
++
++
++def _walk_strings(obj) -> Iterable[str]:
++    if isinstance(obj, str):
++        yield obj
++    elif isinstance(obj, dict):
++        for v in obj.values():
++            yield from _walk_strings(v)
++    elif isinstance(obj, (list, tuple)):
++        for v in obj:
++            yield from _walk_strings(v)
++
++
++def extract_links(html: str) -> list[str]:
++    """
++    Pull every outbound url from an aggregator page.
++
++    Strategy order matters: the embedded JSON payload is authoritative and
++    complete, the anchors are a fallback. We union both because some templates
++    render only half the links server-side.
++    """
++    urls: list[str] = []
++
++    for m in _NEXT_DATA_RE.finditer(html or ""):
++        try:
++            data = json.loads(m.group(1))
++        except (ValueError, TypeError):
++            continue
++        for s in _walk_strings(data):
++            if s.startswith("http"):
++                urls.append(s)
++            else:
++                urls.extend(_BARE_URL_RE.findall(s))
++
++    for m in _NUXT_RE.finditer(html or ""):
++        urls.extend(_BARE_URL_RE.findall(m.group(1)))
++
++    for m in _JSONLD_RE.finditer(html or ""):
++        try:
++            data = json.loads(m.group(1))
++        except (ValueError, TypeError):
++            continue
++        # schema.org sameAs is a first-class identity claim - highest value
++        for s in _walk_strings(data):
++            if s.startswith("http"):
++                urls.append(s)
++
++    urls.extend(_HREF_RE.findall(html or ""))
++
++    seen, out = set(), []
++    for u in urls:
++        u = u.rstrip('\\").,;\'')
++        if u not in seen:
++            seen.add(u)
++            out.append(u)
++    return out
++
++
++def extract_sameas(html: str) -> list[str]:
++    """schema.org sameAs only - a person asserting 'these accounts are me'."""
++    out: list[str] = []
++    for m in _JSONLD_RE.finditer(html or ""):
++        try:
++            data = json.loads(m.group(1))
++        except (ValueError, TypeError):
++            continue
++        stack = [data]
++        while stack:
++            cur = stack.pop()
++            if isinstance(cur, dict):
++                same = cur.get("sameAs")
++                if isinstance(same, str):
++                    out.append(same)
++                elif isinstance(same, list):
++                    out.extend(x for x in same if isinstance(x, str))
++                stack.extend(cur.values())
++            elif isinstance(cur, list):
++                stack.extend(cur)
++    return out
++
++
++def harvest(html: str) -> list[PlatformRef]:
++    """Aggregator html -> deduped PlatformRefs on our 8 target platforms."""
++    refs: dict[str, PlatformRef] = {}
++    for url in extract_links(html):
++        ref = classify_url(url)
++        if ref and ref.key() not in refs:
++            refs[ref.key()] = ref
++    return list(refs.values())
++
++
++# ---------------------------------------------------------------------------
++# generic detector, for aggregators not yet in the registry
++# ---------------------------------------------------------------------------
++
++def looks_like_aggregator(html: str, min_platforms: int = 3,
++                          max_words: int = 400) -> bool:
++    """
++    Heuristic: a thin page whose whole purpose is outbound links to >=3
++    DISTINCT social platforms. Catches Carrd clones, custom bio pages, and
++    an artist's own one-page site - all of which are equally good anchors.
++    """
++    refs = harvest(html)
++    distinct = {r.platform for r in refs}
++    text = re.sub(r"<script.*?</script>", " ", html or "", flags=re.S | re.I)
++    text = re.sub(r"<[^>]+>", " ", text)
++    words = len(text.split())
++    return len(distinct) >= min_platforms and words <= max_words
+diff --git a/identityforge/authorities.py b/identityforge/authorities.py
+new file mode 100644
+index 0000000..1866183
+--- /dev/null
++++ b/identityforge/authorities.py
+@@ -0,0 +1,249 @@
++"""
++The ID hub.
++
++Your Spotify observation, generalised: nearly every platform mints its own
++stable person-id, and Wikidata already stores most of them as properties on a
++single Q-item. So we do NOT integrate N APIs pairwise. We:
++
++    resolve name -> Q-item  (once, with occupation filtering)
++    read every external id off that Q-item  (one call)
++    call individual APIs only to fill gaps
++
++AUTHORITY = a source that mints stable ids and is *disambiguated by design*
++            (one record per human, never per name string).
++
++`verified` marks whether the Wikidata P-number is one I am confident about.
++Anything False must be confirmed by validate_property_map() before trusting -
++P-numbers do get created/merged, and a wrong one silently returns nothing.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Optional
++
++from .platforms import Platform
++
++
++@dataclass(frozen=True)
++class Authority:
++    key: str                      # our internal name
++    label: str
++    wikidata_prop: Optional[str]  # P-number holding this id on a person item
++    url_template: Optional[str]   # {id} substitution
++    domain: str                   # which vertical this authority is strong for
++    is_target_platform: bool = False
++    platform: Optional[Platform] = None
++    verified: bool = True         # confidence in the P-number above
++    self_sufficient: bool = False
++    """One structured hit here is enough to auto-accept - the id is a
++    structural identity link, not a mutable user-supplied handle."""
++    notes: str = ""
++
++
++# ---------------------------------------------------------------------------
++# 1. THE 8 TARGET PLATFORMS - what we actually want to output
++# ---------------------------------------------------------------------------
++
++TARGET_AUTHORITIES: list[Authority] = [
++    Authority("instagram", "Instagram username", "P2003",
++              "https://www.instagram.com/{id}/", "social",
++              True, Platform.INSTAGRAM),
++    Authority("twitter", "X (Twitter) username", "P2002",
++              "https://x.com/{id}", "social", True, Platform.TWITTER),
++    Authority("twitter_numeric", "X numeric user id", "P6552",
++              "https://x.com/i/user/{id}", "social", True, Platform.TWITTER,
++              verified=False, notes="immune to handle changes - store when available"),
++    Authority("facebook", "Facebook id", "P2013",
++              "https://www.facebook.com/{id}", "social", True, Platform.FACEBOOK),
++    Authority("facebook_numeric", "Facebook numeric id", "P4003",
++              "https://www.facebook.com/profile.php?id={id}", "social",
++              True, Platform.FACEBOOK, verified=False),
++    Authority("youtube_channel", "YouTube channel id", "P2397",
++              "https://www.youtube.com/channel/{id}", "social",
++              True, Platform.YOUTUBE,
++              notes="UC... form is permanent; the @handle is not"),
++    Authority("youtube_handle", "YouTube handle", "P11245",
++              "https://www.youtube.com/@{id}", "social",
++              True, Platform.YOUTUBE, verified=False,
++              notes="newer property, confirm before relying on it"),
++    Authority("tiktok", "TikTok username", "P7085",
++              "https://www.tiktok.com/@{id}", "social", True, Platform.TIKTOK),
++    Authority("linkedin", "LinkedIn personal profile id", "P6634",
++              "https://www.linkedin.com/in/{id}/", "professional",
++              True, Platform.LINKEDIN, verified=False,
++              notes="sparsely populated for entertainers; dense for execs/creators"),
++    Authority("imdb", "IMDb id", "P345",
++              "https://www.imdb.com/name/{id}/", "film",
++              True, Platform.IMDB, self_sufficient=True,
++              notes="nm-prefixed; curated, stable, one record per human"),
++    # Wikipedia is not a property - it is the sitelink set on the Q-item.
++    Authority("wikipedia", "Wikipedia article", None,
++              "https://{lang}.wikipedia.org/wiki/{id}", "reference",
++              True, Platform.WIKIPEDIA, self_sufficient=True,
++              notes="read from Q-item sitelinks, not from a claim"),
++]
++
++
++# ---------------------------------------------------------------------------
++# 2. SPOKE AUTHORITIES - not outputs, but powerful *anchors* and disambiguators
++#    These are what let us pick the right person out of 6 same-named ones.
++# ---------------------------------------------------------------------------
++
++SPOKE_AUTHORITIES: list[Authority] = [
++    # --- music (your Spotify case) -----------------------------------------
++    Authority("spotify_artist", "Spotify artist id", "P1902",
++              "https://open.spotify.com/artist/{id}", "music"),
++    Authority("musicbrainz_artist", "MusicBrainz artist id", "P434",
++              "https://musicbrainz.org/artist/{id}", "music",
++              notes="BEST music anchor: its API returns social urls as relations"),
++    Authority("apple_music_artist", "Apple Music artist id", "P2850",
++              "https://music.apple.com/artist/{id}", "music"),
++    Authority("deezer_artist", "Deezer artist id", "P2722",
++              "https://www.deezer.com/artist/{id}", "music"),
++    Authority("genius_artist", "Genius artist id", "P2373",
++              "https://genius.com/artists/{id}", "music"),
++    Authority("soundcloud", "SoundCloud id", "P3040",
++              "https://soundcloud.com/{id}", "music"),
++    Authority("discogs_artist", "Discogs artist id", "P1953",
++              "https://www.discogs.com/artist/{id}", "music"),
++    Authority("lastfm", "Last.fm id", "P3192",
++              "https://www.last.fm/music/{id}", "music"),
++
++    # --- film / tv ---------------------------------------------------------
++    Authority("tmdb_person", "TMDB person id", "P4985",
++              "https://www.themoviedb.org/person/{id}", "film",
++              notes="/person/{id}/external_ids returns imdb+ig+x+tiktok+yt+fb "
++                    "in ONE call - highest ROI integration you can add"),
++    Authority("rotten_tomatoes", "Rotten Tomatoes id", "P1258",
++              "https://www.rottentomatoes.com/{id}", "film"),
++    Authority("letterboxd", "Letterboxd id", "P6127",
++              "https://letterboxd.com/{id}/", "film", verified=False),
++
++    # --- gaming / streaming ----------------------------------------------
++    Authority("twitch", "Twitch channel", "P5797",
++              "https://www.twitch.tv/{id}", "gaming"),
++
++    # --- sport ------------------------------------------------------------
++    Authority("transfermarkt_player", "Transfermarkt player id", "P2446",
++              "https://www.transfermarkt.com/-/profil/spieler/{id}", "sport"),
++    Authority("espn_player", "ESPN player id", "P8286",
++              None, "sport", verified=False,
++              notes="P-number uncertain - validate before use"),
++    Authority("olympedia", "Olympedia athlete id", "P8286",
++              None, "sport", verified=False,
++              notes="placeholder - confirm; sports coverage is the weakest vertical"),
++
++    # --- literature / business / academia ---------------------------------
++    Authority("goodreads_author", "Goodreads author id", "P2963",
++              "https://www.goodreads.com/author/show/{id}", "books",
++              verified=False),
++    Authority("crunchbase_person", "Crunchbase person id", "P2087",
++              "https://www.crunchbase.com/person/{id}", "business",
++              verified=False),
++    Authority("orcid", "ORCID id", "P496",
++              "https://orcid.org/{id}", "academia"),
++]
++
++
++ALL_AUTHORITIES = TARGET_AUTHORITIES + SPOKE_AUTHORITIES
++BY_KEY = {a.key: a for a in ALL_AUTHORITIES}
++
++
++# ---------------------------------------------------------------------------
++# 3. DISAMBIGUATION PROPERTIES - the actual answer to "director vs singer"
++# ---------------------------------------------------------------------------
++
++DISAMBIGUATION_PROPS = {
++    "P31":  "instance_of",          # must be Q5 (human)
++    "P106": "occupation",           # THE discriminator
++    "P569": "date_of_birth",
++    "P570": "date_of_death",
++    "P27":  "citizenship",
++    "P21":  "gender",
++    "P800": "notable_work",
++    "P937": "work_location",
++    "P641": "sport",
++    "P413": "position_played",
++    "P1303": "instrument",
++    "P264": "record_label",
++}
++
++# occupation Q-ids we care about, grouped into the role buckets your ingest
++# requests actually use. Wikidata occupations are hierarchical, so in
++# production also walk P279 (subclass of) upward before giving up.
++OCCUPATION_BUCKETS: dict[str, set[str]] = {
++    "actor":      {"Q33999", "Q10800557", "Q10798782", "Q2405480"},   # actor, film/tv/voice actor
++    "director":   {"Q2526255", "Q3455803", "Q1053574"},               # film dir, director, producer
++    "musician":   {"Q639669", "Q177220", "Q36834", "Q753110", "Q183945"},  # musician, singer, composer, songwriter, record producer
++    "athlete":    {"Q2066131", "Q937857", "Q3665646", "Q10871364"},   # athlete, footballer, basketball, cricketer
++    "creator":    {"Q17125263", "Q2722764", "Q88802976"},             # youtuber, streamer, content creator
++    "model":      {"Q4610556", "Q3286043"},
++    "journalist": {"Q1930187", "Q1607826"},
++    "politician": {"Q82955"},
++    "writer":     {"Q36180", "Q6625963", "Q49757"},
++    "executive":  {"Q484876", "Q43845"},                              # CEO, businessperson
++    "comedian":   {"Q245068"},
++    "chef":       {"Q3499072", "Q156839"},
++}
++
++# which authority is the strongest anchor for each role bucket -> query order
++ANCHOR_PRIORITY: dict[str, list[str]] = {
++    "musician":   ["musicbrainz_artist", "spotify_artist", "wikipedia", "imdb"],
++    "actor":      ["tmdb_person", "imdb", "wikipedia"],
++    "director":   ["tmdb_person", "imdb", "wikipedia"],
++    "creator":    ["youtube_channel", "twitch", "wikipedia"],
++    "athlete":    ["transfermarkt_player", "wikipedia", "imdb"],
++    "executive":  ["linkedin", "crunchbase_person", "wikipedia"],
++    "journalist": ["wikipedia", "linkedin", "twitter"],
++    "writer":     ["goodreads_author", "wikipedia", "imdb"],
++    "_default":   ["wikipedia", "imdb", "tmdb_person"],
++}
++
++
++def anchors_for_role(role: Optional[str]) -> list[str]:
++    return ANCHOR_PRIORITY.get(role or "_default", ANCHOR_PRIORITY["_default"])
++
++
++def occupations_for_role(role: str) -> set[str]:
++    return OCCUPATION_BUCKETS.get(role, set())
++
++
++def role_for_occupation(qid: str) -> Optional[str]:
++    for role, qids in OCCUPATION_BUCKETS.items():
++        if qid in qids:
++            return role
++    return None
++
++
++def unverified_properties() -> list[Authority]:
++    """Run this at startup and log the result. Do not skip it."""
++    return [a for a in ALL_AUTHORITIES if a.wikidata_prop and not a.verified]
++
++
++def validate_property_map(fetch_json) -> dict[str, str]:
++    """
++    Confirm each P-number resolves to the label we expect.
++
++    `fetch_json(url) -> dict` is injected so this module stays offline-testable
++    and so you control rate limiting / caching / user-agent centrally.
++    """
++    results: dict[str, str] = {}
++    props = sorted({a.wikidata_prop for a in ALL_AUTHORITIES if a.wikidata_prop})
++    for i in range(0, len(props), 40):
++        chunk = "|".join(props[i:i + 40])
++        url = ("https://www.wikidata.org/w/api.php?action=wbgetentities"
++               f"&ids={chunk}&props=labels&languages=en&format=json")
++        try:
++            data = fetch_json(url)
++        except Exception as exc:                      # noqa: BLE001
++            for p in props[i:i + 40]:
++                results[p] = f"ERROR: {exc}"
++            continue
++        for p in props[i:i + 40]:
++            ent = (data.get("entities") or {}).get(p) or {}
++            if ent.get("missing") is not None or "labels" not in ent:
++                results[p] = "MISSING"
++            else:
++                results[p] = ent["labels"].get("en", {}).get("value", "?")
++    return results
+diff --git a/identityforge/evidence.py b/identityforge/evidence.py
+new file mode 100644
+index 0000000..3bc2a1e
+--- /dev/null
++++ b/identityforge/evidence.py
+@@ -0,0 +1,202 @@
++"""
++Evidence model.
++
++Every handle we output carries a tier + a source url + a timestamp. Two payoffs:
++
++  1. auto-accept / review / reject becomes a threshold, not a vibe
++  2. when a handle turns out wrong, you know WHICH tier misfired and can
++     retune one number instead of rewriting the pipeline
++
++Rule that must never be relaxed: a name string match is Tier 5 and can never
++by itself promote a claim to accepted. That rule is the whole point of the tool.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from enum import IntEnum
++from typing import Optional
++
++from .platforms import Platform, PlatformRef
++
++
++class Tier(IntEnum):
++    STRUCTURED_ID = 1     # Wikidata claim, TMDB external_ids, MusicBrainz relation
++    SELF_DECLARED = 2     # aggregator page, bio link, schema.org sameAs
++    BIDIRECTIONAL = 3     # A links to B AND B links to A  <- strongest in practice
++    CORROBORATING = 4     # avatar hash, verified badge, shared domain/email
++    NAME_MATCH = 5        # never sufficient alone
++
++
++TIER_WEIGHT: dict[Tier, float] = {
++    Tier.BIDIRECTIONAL: 0.78,   # gold standard: sufficient alone
++    Tier.STRUCTURED_ID: 0.55,
++    Tier.SELF_DECLARED: 0.45,   # structured + self-declared must clear 0.75
++    Tier.CORROBORATING: 0.15,
++    Tier.NAME_MATCH: 0.00,
++}
++
++AUTO_ACCEPT = 0.75
++REVIEW_FLOOR = 0.35
++
++
++@dataclass
++class Evidence:
++    tier: Tier
++    source: str                     # 'wikidata:P2003' | 'linktr.ee/foo' | 'avatar_phash'
++    source_url: str = ""
++    detail: str = ""
++    authoritative: bool = False
++    """
++    True only for sources where the id is a STRUCTURAL identity link rather
++    than an editable claim - a Wikidata sitelink (1:1 with the Q-item by
++    construction) or a curated IMDb nm-id. These are self-sufficient.
++
++    Volunteer-added social handles (P2003, P2002...) are NOT authoritative:
++    they go stale when someone rebrands, so they still want corroboration.
++    """
++    observed_at: str = field(
++        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
++
++
++@dataclass
++class HandleClaim:
++    """One (platform, handle) plus everything that argues for it."""
++    ref: PlatformRef
++    evidence: list[Evidence] = field(default_factory=list)
++
++    def add(self, ev: Evidence) -> "HandleClaim":
++        self.evidence.append(ev)
++        return self
++
++    @property
++    def tiers(self) -> set[Tier]:
++        return {e.tier for e in self.evidence}
++
++    @property
++    def best_tier(self) -> Optional[Tier]:
++        return min(self.tiers) if self.evidence else None
++
++    def confidence(self) -> float:
++        """
++        Independent-corroboration model: each DISTINCT tier contributes once,
++        with diminishing returns. Two sources of the same kind are worth far
++        less than two sources of different kinds - which is exactly the real
++        epistemics, since same-kind sources tend to copy each other.
++        """
++        if not self.evidence:
++            return 0.0
++        remaining = 1.0
++        for tier in sorted(self.tiers):
++            remaining *= (1.0 - TIER_WEIGHT[tier])
++        score = 1.0 - remaining
++        # a second independent source within the same tier: small top-up
++        for tier in self.tiers:
++            n = sum(1 for e in self.evidence if e.tier == tier)
++            if n > 1 and TIER_WEIGHT[tier] > 0:
++                score += min(n - 1, 2) * 0.03
++        if any(e.authoritative for e in self.evidence):
++            score = max(score, AUTO_ACCEPT + 0.05)
++        return round(min(score, 0.99), 3)
++
++    def verdict(self) -> str:
++        c = self.confidence()
++        if self.tiers == {Tier.NAME_MATCH}:
++            return "reject"          # hard rule, regardless of score
++        if c >= AUTO_ACCEPT:
++            return "accept"
++        if c >= REVIEW_FLOOR:
++            return "review"
++        return "reject"
++
++
++@dataclass
++class Candidate:
++    """A possible human behind the queried name."""
++    entity_id: str                       # 'Q23505' or 'nm0000138'
++    label: str = ""
++    description: str = ""
++    occupations: list[str] = field(default_factory=list)   # Q-ids
++    roles: list[str] = field(default_factory=list)         # our buckets
++    birth_year: Optional[int] = None
++    death_year: Optional[int] = None
++    citizenship: list[str] = field(default_factory=list)
++    notable_work: list[str] = field(default_factory=list)
++    external_ids: dict[str, str] = field(default_factory=dict)
++    claims: dict[str, HandleClaim] = field(default_factory=dict)
++    role_score: float = 0.0
++    thumbnail: str = ""
++
++    def add_claim(self, ref: PlatformRef, ev: Evidence) -> None:
++        k = ref.key()
++        if k not in self.claims:
++            self.claims[k] = HandleClaim(ref)
++        self.claims[k].add(ev)
++
++    def accepted(self) -> dict[Platform, list[HandleClaim]]:
++        out: dict[Platform, list[HandleClaim]] = {}
++        for c in self.claims.values():
++            if c.verdict() == "accept":
++                out.setdefault(c.ref.platform, []).append(c)
++        return out
++
++    def coverage(self, targets) -> float:
++        got = set(self.accepted().keys())
++        return round(len(got & set(targets)) / max(len(targets), 1), 3)
++
++
++def score_role_match(cand: Candidate, expected_role: Optional[str],
++                     expected_country: Optional[str] = None,
++                     expected_active_year: Optional[int] = None) -> float:
++    """
++    The 'director vs actor vs singer' discriminator.
++
++    Deliberately does NOT look at the name at all - by the time we are here,
++    every candidate matches the name. Only role/era/country separate them.
++    """
++    score = 0.0
++    if expected_role:
++        if expected_role in cand.roles:
++            score += 0.60
++        elif cand.roles:
++            score -= 0.25            # positively wrong vertical
++    if expected_country and cand.citizenship:
++        score += 0.15 if expected_country in cand.citizenship else -0.10
++    if expected_active_year and cand.birth_year:
++        age = expected_active_year - cand.birth_year
++        if 12 <= age <= 90:
++            score += 0.15
++        else:
++            score -= 0.30            # dead or unborn at the relevant time
++    if cand.death_year and expected_active_year and expected_active_year > cand.death_year:
++        score -= 0.40
++    # a person with many external ids is the notable one, weak but real signal
++    score += min(len(cand.external_ids), 6) * 0.02
++    cand.role_score = round(score, 3)
++    return cand.role_score
++
++
++def rank(candidates: list[Candidate], margin: float = 0.25) -> dict:
++    """
++    Returns a routing decision, not just a winner.
++
++    'disambiguate' is a feature, not a failure: a human clicking one card in
++    3 seconds beats 20 minutes of searching, and beats a silently wrong guess.
++    """
++    if not candidates:
++        return {"decision": "not_found", "winner": None, "candidates": []}
++    ranked = sorted(candidates, key=lambda c: c.role_score, reverse=True)
++    top = ranked[0]
++    if len(ranked) == 1:
++        return {"decision": "resolved", "winner": top, "candidates": ranked}
++    gap = top.role_score - ranked[1].role_score
++    if top.role_score <= 0:
++        return {"decision": "disambiguate", "winner": None, "candidates": ranked,
++                "reason": "no candidate matches the expected role"}
++    if gap >= margin:
++        return {"decision": "resolved", "winner": top, "candidates": ranked,
++                "margin": round(gap, 3)}
++    return {"decision": "disambiguate", "winner": None, "candidates": ranked,
++            "margin": round(gap, 3),
++            "reason": f"top two within {margin} - collision, human picks"}
+diff --git a/identityforge/fetcher.py b/identityforge/fetcher.py
+new file mode 100644
+index 0000000..67d2abc
+--- /dev/null
++++ b/identityforge/fetcher.py
+@@ -0,0 +1,248 @@
++"""
++The one place network I/O happens.
++
++Everything in the resolver takes `fetch(url, kind)` as an argument, so this is
++the single chokepoint for caching, rate limiting, retries, user-agent policy and
++the domain allowlist. That is the whole reason the resolver is dependency-injected:
++one file to audit when you get throttled or blocked.
++
++Politeness is not optional here. Wikidata's SPARQL endpoint and MusicBrainz both
++publish rate limits and will ban an IP that ignores them, and link-in-bio pages
++are ordinary websites whose ToS you are subject to.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import sqlite3
++import threading
++import time
++import urllib.error
++import urllib.request
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from typing import Optional
++from urllib.parse import urlsplit
++
++DEFAULT_UA = (
++    "IdentityForge/0.2 (ListenFirst Media data operations; "
++    "contact ramesh@listenfirstmedia.com)"
++)
++
++# MusicBrainz requires <=1 req/sec. Wikidata asks for serial, low-concurrency
++# use and will 429. Everything else gets a conservative default.
++RATE_LIMITS: dict[str, float] = {
++    "musicbrainz.org": 1.1,
++    "query.wikidata.org": 1.5,
++    "www.wikidata.org": 0.4,
++    "api.themoviedb.org": 0.06,
++    "_default": 1.0,
++}
++
++# Only these are ever fetched. An open-ended fetcher pointed at user input is
++# an SSRF hole, so the allowlist is a security control, not just tidiness.
++ALLOWED_SUFFIXES: tuple[str, ...] = (
++    "wikidata.org", "wikipedia.org", "musicbrainz.org", "themoviedb.org",
++    "imdb.com", "instagram.com", "facebook.com", "twitter.com", "x.com",
++    "youtube.com", "tiktok.com", "linkedin.com", "open.spotify.com",
++    # link-in-bio hosts
++    "linktr.ee", "beacons.ai", "bio.link", "allmylinks.com", "solo.to",
++    "taplink.cc", "linkr.bio", "lnk.bio", "linkin.bio", "komi.io", "hoo.be",
++    "stan.store", "direct.me", "shorby.com", "campsite.bio", "flowcode.com",
++    "znap.link", "carrd.co", "about.me", "milkshake.app", "tap.bio",
++    "withkoji.com",
++)
++
++CACHE_SCHEMA = """
++CREATE TABLE IF NOT EXISTS http_cache (
++    url_hash TEXT PRIMARY KEY,
++    url TEXT, kind TEXT, status INTEGER,
++    body TEXT, fetched_at TEXT
++);
++"""
++
++
++@dataclass
++class FetchStats:
++    hits: int = 0
++    misses: int = 0
++    blocked: int = 0
++    errors: int = 0
++    bytes_in: int = 0
++    urls: list[str] = field(default_factory=list)
++
++    def as_dict(self) -> dict:
++        return {"cache_hits": self.hits, "network_calls": self.misses,
++                "blocked": self.blocked, "errors": self.errors,
++                "bytes_in": self.bytes_in}
++
++
++class CachedFetcher:
++    """
++    Callable matching the resolver's `fetch(url, kind='text'|'json')` contract.
++
++    Cache is on by default and aggressive. Identity data changes slowly; a repeat
++    resolution of the same person should cost zero requests.
++    """
++
++    def __init__(self, cache_path: str = "http_cache.db",
++                 ttl_seconds: int = 7 * 24 * 3600,
++                 user_agent: str = DEFAULT_UA,
++                 timeout: int = 20,
++                 max_retries: int = 3,
++                 offline: bool = False):
++        self.ttl = ttl_seconds
++        self.ua = user_agent
++        self.timeout = timeout
++        self.max_retries = max_retries
++        self.offline = offline
++        self.stats = FetchStats()
++        self._lock = threading.Lock()
++        self._last_call: dict[str, float] = {}
++        self._conn = sqlite3.connect(cache_path, check_same_thread=False)
++        self._conn.executescript(CACHE_SCHEMA)
++        self._conn.commit()
++
++    # -- policy ----------------------------------------------------------
++    @staticmethod
++    def _host(url: str) -> str:
++        return (urlsplit(url).hostname or "").lower()
++
++    def _allowed(self, url: str) -> bool:
++        host = self._host(url)
++        return any(host == s or host.endswith("." + s) for s in ALLOWED_SUFFIXES)
++
++    def _throttle(self, host: str) -> None:
++        key = next((k for k in RATE_LIMITS if host.endswith(k)), "_default")
++        gap = RATE_LIMITS[key]
++        with self._lock:
++            last = self._last_call.get(key, 0.0)
++            wait = gap - (time.monotonic() - last)
++            if wait > 0:
++                time.sleep(wait)
++            self._last_call[key] = time.monotonic()
++
++    # -- cache -----------------------------------------------------------
++    def _cache_get(self, url: str) -> Optional[str]:
++        h = hashlib.sha256(url.encode()).hexdigest()
++        row = self._conn.execute(
++            "SELECT body, fetched_at FROM http_cache WHERE url_hash=?", (h,)
++        ).fetchone()
++        if not row:
++            return None
++        body, fetched_at = row
++        try:
++            age = (datetime.now(timezone.utc)
++                   - datetime.fromisoformat(fetched_at)).total_seconds()
++        except ValueError:
++            return None
++        return body if age < self.ttl else None
++
++    def _cache_put(self, url: str, kind: str, status: int, body: str) -> None:
++        h = hashlib.sha256(url.encode()).hexdigest()
++        self._conn.execute(
++            "INSERT OR REPLACE INTO http_cache VALUES (?,?,?,?,?,?)",
++            (h, url, kind, status, body,
++             datetime.now(timezone.utc).isoformat(timespec="seconds")))
++        self._conn.commit()
++
++    # -- the callable ----------------------------------------------------
++    def __call__(self, url: str, kind: str = "text"):
++        if not self._allowed(url):
++            self.stats.blocked += 1
++            return {} if kind == "json" else ""
++
++        cached = self._cache_get(url)
++        if cached is not None:
++            self.stats.hits += 1
++            return self._decode(cached, kind)
++
++        if self.offline:
++            self.stats.blocked += 1
++            return {} if kind == "json" else ""
++
++        body = self._get(url, kind)
++        if body is None:
++            self.stats.errors += 1
++            return {} if kind == "json" else ""
++
++        self.stats.misses += 1
++        self.stats.bytes_in += len(body)
++        if len(self.stats.urls) < 200:
++            self.stats.urls.append(url)
++        self._cache_put(url, kind, 200, body)
++        return self._decode(body, kind)
++
++    @staticmethod
++    def _decode(body: str, kind: str):
++        if kind != "json":
++            return body
++        try:
++            return json.loads(body)
++        except (ValueError, TypeError):
++            return {}
++
++    def _get(self, url: str, kind: str) -> Optional[str]:
++        headers = {
++            "User-Agent": self.ua,
++            "Accept": ("application/sparql-results+json, application/json"
++                       if kind == "json" else
++                       "text/html,application/xhtml+xml"),
++            "Accept-Language": "en",
++        }
++        for attempt in range(self.max_retries):
++            self._throttle(self._host(url))
++            req = urllib.request.Request(url, headers=headers)
++            try:
++                with urllib.request.urlopen(req, timeout=self.timeout) as r:
++                    raw = r.read()
++                    charset = r.headers.get_content_charset() or "utf-8"
++                    return raw.decode(charset, errors="replace")
++            except urllib.error.HTTPError as e:
++                # 429/503 are the throttle signals both Wikidata and
++                # MusicBrainz use - back off, do not hammer.
++                if e.code in (429, 500, 502, 503, 504):
++                    retry_after = e.headers.get("Retry-After")
++                    delay = (float(retry_after) if retry_after
++                             and retry_after.isdigit() else 2 ** (attempt + 1))
++                    time.sleep(min(delay, 30))
++                    continue
++                return None                     # 404/403 - do not retry
++            except (urllib.error.URLError, TimeoutError, OSError):
++                time.sleep(2 ** attempt)
++        return None
++
++    def reset_stats(self) -> None:
++        self.stats = FetchStats()
++
++
++class FixtureFetcher:
++    """
++    Deterministic offline fetcher for the demo mode and for tests.
++
++    Render's free tier sleeps and cold-starts, and Wikidata is not something to
++    lean on for a first-load demo, so the deployed app ships with this and only
++    goes live when the operator flips the switch.
++    """
++
++    def __init__(self, fixtures: dict[str, object]):
++        self.fixtures = fixtures
++        self.calls: list[str] = []
++
++    def __call__(self, url: str, kind: str = "text"):
++        self.calls.append(url)
++        for needle, payload in self.fixtures.items():
++            if needle in url:
++                return payload
++        return {} if kind == "json" else ""
++
++
++def build_fetcher(offline: bool = False) -> CachedFetcher:
++    return CachedFetcher(
++        cache_path=os.environ.get("IF_CACHE_PATH", "http_cache.db"),
++        ttl_seconds=int(os.environ.get("IF_CACHE_TTL", 7 * 24 * 3600)),
++        user_agent=os.environ.get("IF_USER_AGENT", DEFAULT_UA),
++        offline=offline,
++    )
+diff --git a/identityforge/platforms.py b/identityforge/platforms.py
+new file mode 100644
+index 0000000..992386d
+--- /dev/null
++++ b/identityforge/platforms.py
+@@ -0,0 +1,275 @@
++"""
++Platform registry + URL classifier/normaliser.
++
++Given ANY url found anywhere (a Linktree row, an IG bio, a Wikidata claim),
++answer two questions deterministically:
++
++    1. which of our 8 target platforms is this?
++    2. what is the canonical handle / id?
++
++Everything downstream keys off (Platform, handle) pairs, never raw urls.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Optional
++from urllib.parse import urlsplit, unquote, parse_qs
++
++
++class Platform(str, Enum):
++    FACEBOOK = "facebook"
++    INSTAGRAM = "instagram"
++    TWITTER = "twitter"          # X
++    YOUTUBE = "youtube"
++    WIKIPEDIA = "wikipedia"
++    IMDB = "imdb"
++    TIKTOK = "tiktok"
++    LINKEDIN = "linkedin"
++
++
++TARGET_PLATFORMS: tuple[Platform, ...] = tuple(Platform)
++
++
++# --------------------------------------------------------------------------
++# url junk stripping
++# --------------------------------------------------------------------------
++
++_TRACKING_PREFIXES = ("utm_", "fb", "ig", "_r", "_t", "si", "gclid", "mc_")
++
++# handles that are actually product routes, never people
++_RESERVED = {
++    "instagram": {"p", "reel", "reels", "explore", "stories", "tv", "accounts",
++                  "direct", "about", "developer", "legal", "privacy", "help"},
++    "facebook": {"pages", "groups", "events", "watch", "marketplace", "photo",
++                 "photo.php", "story.php", "profile.php", "sharer", "login",
++                 "help", "policies", "permalink.php", "media", "hashtag"},
++    "twitter": {"i", "home", "search", "explore", "hashtag", "intent",
++                "share", "settings", "messages", "notifications", "compose"},
++    "tiktok": {"tag", "music", "discover", "foryou", "explore", "live",
++               "legal", "about", "upload"},
++    "linkedin": {"feed", "jobs", "learning", "pulse", "posts", "help",
++                 "legal", "checkpoint", "authwall", "signup", "login"},
++    "youtube": {"watch", "playlist", "results", "feed", "shorts", "hashtag",
++                "about", "redirect", "channel", "user", "c"},
++}
++
++
++def _clean_query(qs: str) -> dict[str, list[str]]:
++    parsed = parse_qs(qs, keep_blank_values=False)
++    return {
++        k: v for k, v in parsed.items()
++        if not any(k.lower().startswith(p) for p in _TRACKING_PREFIXES)
++    }
++
++
++def _strip_at(s: str) -> str:
++    return s[1:] if s.startswith("@") else s
++
++
++@dataclass(frozen=True)
++class PlatformRef:
++    """A resolved (platform, handle) pair plus what kind of id it is."""
++    platform: Platform
++    handle: str
++    id_kind: str = "handle"        # handle | channel_id | numeric_id | nm_id | page_title
++    lang: Optional[str] = None     # wikipedia only
++    canonical_url: str = ""
++    raw_url: str = ""
++
++    def key(self) -> str:
++        base = f"{self.platform.value}:{self.handle.lower()}"
++        return f"{base}@{self.lang}" if self.lang else base
++
++
++# --------------------------------------------------------------------------
++# per-platform parsers
++# --------------------------------------------------------------------------
++
++def _parse_instagram(host, parts, q, url) -> Optional[PlatformRef]:
++    if not parts:
++        return None
++    h = _strip_at(parts[0])
++    if h.lower() in _RESERVED["instagram"] or not h:
++        return None
++    return PlatformRef(Platform.INSTAGRAM, h, "handle",
++                       canonical_url=f"https://www.instagram.com/{h}/", raw_url=url)
++
++
++def _parse_facebook(host, parts, q, url) -> Optional[PlatformRef]:
++    # profile.php?id=123456
++    if parts and parts[0] == "profile.php" and "id" in q:
++        pid = q["id"][0]
++        return PlatformRef(Platform.FACEBOOK, pid, "numeric_id",
++                           canonical_url=f"https://www.facebook.com/profile.php?id={pid}",
++                           raw_url=url)
++    # /pages/Name/12345  -> take the numeric id, it is the stable part
++    if len(parts) >= 3 and parts[0] == "pages" and parts[-1].isdigit():
++        return PlatformRef(Platform.FACEBOOK, parts[-1], "numeric_id",
++                           canonical_url=f"https://www.facebook.com/{parts[-1]}", raw_url=url)
++    if not parts:
++        return None
++    h = parts[0]
++    if h.lower() in _RESERVED["facebook"] or not h:
++        return None
++    return PlatformRef(Platform.FACEBOOK, h, "handle",
++                       canonical_url=f"https://www.facebook.com/{h}", raw_url=url)
++
++
++def _parse_twitter(host, parts, q, url) -> Optional[PlatformRef]:
++    # /i/user/12345 numeric
++    if len(parts) >= 3 and parts[0] == "i" and parts[1] == "user":
++        return PlatformRef(Platform.TWITTER, parts[2], "numeric_id",
++                           canonical_url=f"https://x.com/i/user/{parts[2]}", raw_url=url)
++    if not parts:
++        return None
++    h = _strip_at(parts[0])
++    if h.lower() in _RESERVED["twitter"] or not h:
++        return None
++    return PlatformRef(Platform.TWITTER, h, "handle",
++                       canonical_url=f"https://x.com/{h}", raw_url=url)
++
++
++_YT_CHANNEL_RE = re.compile(r"^UC[0-9A-Za-z_-]{22}$")
++
++
++def _parse_youtube(host, parts, q, url) -> Optional[PlatformRef]:
++    if host.endswith("youtu.be"):
++        return None  # a video, not an identity
++    if not parts:
++        return None
++    first = parts[0]
++    if first == "channel" and len(parts) > 1:
++        cid = parts[1]
++        kind = "channel_id" if _YT_CHANNEL_RE.match(cid) else "handle"
++        return PlatformRef(Platform.YOUTUBE, cid, kind,
++                           canonical_url=f"https://www.youtube.com/channel/{cid}", raw_url=url)
++    if first in ("c", "user") and len(parts) > 1:
++        return PlatformRef(Platform.YOUTUBE, parts[1], "handle",
++                           canonical_url=f"https://www.youtube.com/{first}/{parts[1]}", raw_url=url)
++    if first.startswith("@"):
++        h = _strip_at(first)
++        return PlatformRef(Platform.YOUTUBE, h, "handle",
++                           canonical_url=f"https://www.youtube.com/@{h}", raw_url=url)
++    if first.lower() in _RESERVED["youtube"]:
++        return None
++    if _YT_CHANNEL_RE.match(first):
++        return PlatformRef(Platform.YOUTUBE, first, "channel_id",
++                           canonical_url=f"https://www.youtube.com/channel/{first}", raw_url=url)
++    return None
++
++
++def _parse_tiktok(host, parts, q, url) -> Optional[PlatformRef]:
++    if not parts:
++        return None
++    if not parts[0].startswith("@"):
++        return None                       # /tag/, /music/, short links -> not identity
++    h = _strip_at(parts[0])
++    if not h or h.lower() in _RESERVED["tiktok"]:
++        return None
++    return PlatformRef(Platform.TIKTOK, h, "handle",
++                       canonical_url=f"https://www.tiktok.com/@{h}", raw_url=url)
++
++
++def _parse_linkedin(host, parts, q, url) -> Optional[PlatformRef]:
++    if len(parts) >= 2 and parts[0] == "in":
++        h = parts[1]
++        return PlatformRef(Platform.LINKEDIN, h, "handle",
++                           canonical_url=f"https://www.linkedin.com/in/{h}/", raw_url=url)
++    if len(parts) >= 2 and parts[0] in ("company", "school"):
++        # keep it, but flagged - a company page is NOT a person
++        return PlatformRef(Platform.LINKEDIN, parts[1], "company",
++                           canonical_url=f"https://www.linkedin.com/company/{parts[1]}/",
++                           raw_url=url)
++    return None
++
++
++_NM_RE = re.compile(r"\b(nm\d{5,10})\b", re.I)
++
++
++def _parse_imdb(host, parts, q, url) -> Optional[PlatformRef]:
++    m = _NM_RE.search("/".join(parts))
++    if not m:
++        return None
++    nm = m.group(1).lower()
++    return PlatformRef(Platform.IMDB, nm, "nm_id",
++                       canonical_url=f"https://www.imdb.com/name/{nm}/", raw_url=url)
++
++
++def _parse_wikipedia(host, parts, q, url) -> Optional[PlatformRef]:
++    lang = host.split(".")[0]
++    if lang in ("www", "wikipedia"):
++        lang = "en"
++    title = None
++    if len(parts) >= 2 and parts[0] == "wiki":
++        title = "/".join(parts[1:])
++    elif parts and parts[0] == "w" and "title" in q:
++        title = q["title"][0]
++    if not title:
++        return None
++    title = unquote(title).replace("_", " ").strip()
++    if not title or ":" in title.split(" ")[0] and title.split(":")[0] in (
++            "File", "Category", "Template", "Help", "Special", "Talk"):
++        return None
++    return PlatformRef(Platform.WIKIPEDIA, title, "page_title", lang=lang,
++                       canonical_url=f"https://{lang}.wikipedia.org/wiki/"
++                                     f"{title.replace(' ', '_')}", raw_url=url)
++
++
++_HOST_ROUTES: list[tuple[re.Pattern, callable]] = [
++    (re.compile(r"(^|\.)instagram\.com$"), _parse_instagram),
++    (re.compile(r"(^|\.)instagr\.am$"), _parse_instagram),
++    (re.compile(r"(^|\.)facebook\.com$"), _parse_facebook),
++    (re.compile(r"(^|\.)fb\.com$"), _parse_facebook),
++    (re.compile(r"(^|\.)fb\.me$"), _parse_facebook),
++    (re.compile(r"(^|\.)twitter\.com$"), _parse_twitter),
++    (re.compile(r"(^|\.)x\.com$"), _parse_twitter),
++    (re.compile(r"(^|\.)youtube\.com$"), _parse_youtube),
++    (re.compile(r"(^|\.)youtu\.be$"), _parse_youtube),
++    (re.compile(r"(^|\.)tiktok\.com$"), _parse_tiktok),
++    (re.compile(r"(^|\.)linkedin\.com$"), _parse_linkedin),
++    (re.compile(r"(^|\.)imdb\.com$"), _parse_imdb),
++    (re.compile(r"(^|\.)wikipedia\.org$"), _parse_wikipedia),
++]
++
++
++def classify_url(url: str) -> Optional[PlatformRef]:
++    """Return a PlatformRef if `url` identifies a person on a target platform."""
++    if not url or not isinstance(url, str):
++        return None
++    url = url.strip()
++    if url.startswith("//"):
++        url = "https:" + url
++    if "://" not in url:
++        url = "https://" + url
++    try:
++        sp = urlsplit(url)
++    except ValueError:
++        return None
++    host = (sp.hostname or "").lower().lstrip(".")
++    if host.startswith("m.") or host.startswith("mobile."):
++        host = host.split(".", 1)[1]
++    parts = [p for p in sp.path.split("/") if p]
++    q = _clean_query(sp.query)
++    for pat, fn in _HOST_ROUTES:
++        if pat.search(host):
++            return fn(host, parts, q, url)
++    return None
++
++
++def build_url(platform: Platform, handle: str, lang: str = "en") -> str:
++    """Inverse of classify_url - used for probing candidate handles."""
++    h = _strip_at(handle)
++    return {
++        Platform.INSTAGRAM: f"https://www.instagram.com/{h}/",
++        Platform.FACEBOOK: f"https://www.facebook.com/{h}",
++        Platform.TWITTER: f"https://x.com/{h}",
++        Platform.YOUTUBE: (f"https://www.youtube.com/channel/{h}"
++                           if _YT_CHANNEL_RE.match(h) else f"https://www.youtube.com/@{h}"),
++        Platform.TIKTOK: f"https://www.tiktok.com/@{h}",
++        Platform.LINKEDIN: f"https://www.linkedin.com/in/{h}/",
++        Platform.IMDB: f"https://www.imdb.com/name/{h.lower()}/",
++        Platform.WIKIPEDIA: f"https://{lang}.wikipedia.org/wiki/{h.replace(' ', '_')}",
++    }[platform]
+diff --git a/identityforge/resolver.py b/identityforge/resolver.py
+new file mode 100644
+index 0000000..379072e
+--- /dev/null
++++ b/identityforge/resolver.py
+@@ -0,0 +1,496 @@
++"""
++Orchestration.
++
++All network I/O is injected as a single `fetch(url, kind) -> str|dict` callable.
++That is deliberate: it keeps this module unit-testable offline, and it forces
++rate limiting, caching, retries and user-agent policy to live in ONE place
++instead of being sprinkled across 20 integrations.
++
++Pipeline:
++
++    intake(name, hints)
++      -> entity store lookup            (never research the same name twice)
++      -> candidate discovery            Wikidata, role-filtered
++      -> role scoring + rank            resolved | disambiguate | not_found
++      -> harvest structured ids         one Q-item read = every spoke id
++      -> gap fill                       TMDB / MusicBrainz only where missing
++      -> bio-link cascade               seed -> aggregator -> all platforms
++      -> bidirectional confirmation
++      -> confidence -> accept/review/reject
++      -> write back with provenance
++"""
++
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++import threading
++from dataclasses import dataclass, field, asdict
++from datetime import datetime, timezone
++from typing import Callable, Optional
++
++from .authorities import (ALL_AUTHORITIES, BY_KEY, TARGET_AUTHORITIES,
++                          anchors_for_role, occupations_for_role,
++                          role_for_occupation)
++from .aggregators import (harvest, is_aggregator_url, looks_like_aggregator,
++                          probe_urls, extract_links, extract_sameas)
++from .evidence import (Candidate, Evidence, HandleClaim, Tier, rank,
++                       score_role_match)
++from .platforms import (Platform, PlatformRef, TARGET_PLATFORMS, build_url,
++                        classify_url)
++
++Fetch = Callable[..., object]
++
++WD_API = "https://www.wikidata.org/w/api.php"
++WD_SPARQL = "https://query.wikidata.org/sparql"
++
++
++@dataclass
++class Intake:
++    """What an ingest request actually gives you - use ALL of it."""
++    name: str
++    expected_role: Optional[str] = None      # 'actor' | 'musician' | ...
++    country: Optional[str] = None            # Q-id
++    active_year: Optional[int] = None
++    context: str = ""                        # show/brand/campaign it came from
++    known_handles: dict[str, str] = field(default_factory=dict)  # platform->handle
++    client: str = ""
++
++
++# ---------------------------------------------------------------------------
++# candidate discovery
++# ---------------------------------------------------------------------------
++
++_SPARQL_CANDIDATES = """
++SELECT ?p ?pLabel ?pDesc ?occ ?dob ?dod ?cit ?img WHERE {{
++  ?p rdfs:label|skos:altLabel "{name}"@en .
++  ?p wdt:P31 wd:Q5 .
++  OPTIONAL {{ ?p wdt:P106 ?occ. }}
++  OPTIONAL {{ ?p wdt:P569 ?dob. }}
++  OPTIONAL {{ ?p wdt:P570 ?dod. }}
++  OPTIONAL {{ ?p wdt:P27  ?cit. }}
++  OPTIONAL {{ ?p wdt:P18  ?img. }}
++  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". 
++    ?p rdfs:label ?pLabel . ?p schema:description ?pDesc . }}
++}} LIMIT 200
++"""
++
++
++def _qid(uri: str) -> str:
++    return uri.rsplit("/", 1)[-1]
++
++
++def discover_candidates(intake: Intake, fetch: Fetch) -> list[Candidate]:
++    """
++    One SPARQL call returns EVERY human with this name/alias, each already a
++    distinct entity. This is the step that structurally eliminates your
++    same-name problem - we are no longer matching strings, we are enumerating
++    people and then filtering by role.
++    """
++    q = _SPARQL_CANDIDATES.format(name=intake.name.replace('"', '\\"'))
++    url = f"{WD_SPARQL}?query={_urlq(q)}&format=json"
++    data = fetch(url, kind="json")
++    rows = (data or {}).get("results", {}).get("bindings", [])
++
++    by_id: dict[str, Candidate] = {}
++    for r in rows:
++        qid = _qid(r["p"]["value"])
++        c = by_id.setdefault(qid, Candidate(entity_id=qid))
++        c.label = c.label or r.get("pLabel", {}).get("value", "")
++        c.description = c.description or r.get("pDesc", {}).get("value", "")
++        if "occ" in r:
++            occ = _qid(r["occ"]["value"])
++            if occ not in c.occupations:
++                c.occupations.append(occ)
++        if "cit" in r:
++            cit = _qid(r["cit"]["value"])
++            if cit not in c.citizenship:
++                c.citizenship.append(cit)
++        if "dob" in r and not c.birth_year:
++            c.birth_year = _year(r["dob"]["value"])
++        if "dod" in r and not c.death_year:
++            c.death_year = _year(r["dod"]["value"])
++        if "img" in r and not c.thumbnail:
++            c.thumbnail = r["img"]["value"]
++
++    for c in by_id.values():
++        c.roles = sorted({r for o in c.occupations
++                          if (r := role_for_occupation(o))})
++        score_role_match(c, intake.expected_role, intake.country,
++                         intake.active_year)
++    return list(by_id.values())
++
++
++def _year(iso: str) -> Optional[int]:
++    m = re.match(r"^(-?\d{1,4})-", iso or "")
++    return int(m.group(1)) if m else None
++
++
++def _urlq(s: str) -> str:
++    from urllib.parse import quote
++    return quote(s, safe="")
++
++
++# ---------------------------------------------------------------------------
++# structured id harvest - the hub read
++# ---------------------------------------------------------------------------
++
++def harvest_structured_ids(cand: Candidate, fetch: Fetch) -> None:
++    """
++    ONE wbgetentities call gives us every spoke id + every Wikipedia sitelink.
++    This is the single highest-yield request in the whole pipeline.
++    """
++    url = (f"{WD_API}?action=wbgetentities&ids={cand.entity_id}"
++           "&props=claims|sitelinks&format=json")
++    data = fetch(url, kind="json")
++    ent = ((data or {}).get("entities") or {}).get(cand.entity_id) or {}
++    claims = ent.get("claims") or {}
++
++    prop_to_auth = {a.wikidata_prop: a for a in ALL_AUTHORITIES if a.wikidata_prop}
++
++    for prop, auth in prop_to_auth.items():
++        for st in claims.get(prop, []):
++            val = (((st.get("mainsnak") or {}).get("datavalue") or {}).get("value"))
++            if not isinstance(val, str):
++                continue
++            cand.external_ids[auth.key] = val
++            if auth.is_target_platform and auth.platform:
++                ref = PlatformRef(
++                    auth.platform, val,
++                    "channel_id" if auth.key == "youtube_channel" else "handle",
++                    canonical_url=(auth.url_template or "").format(id=val))
++                cand.add_claim(ref, Evidence(
++                    Tier.STRUCTURED_ID, f"wikidata:{prop}",
++                    f"https://www.wikidata.org/wiki/{cand.entity_id}",
++                    detail=auth.label,
++                    authoritative=auth.self_sufficient))
++
++    for site, link in (ent.get("sitelinks") or {}).items():
++        if not site.endswith("wiki") or site in ("commonswiki", "specieswiki"):
++            continue
++        lang = site[:-4].replace("_", "-")
++        title = link.get("title", "")
++        if not title:
++            continue
++        ref = PlatformRef(Platform.WIKIPEDIA, title, "page_title", lang=lang,
++                          canonical_url=f"https://{lang}.wikipedia.org/wiki/"
++                                        f"{title.replace(' ', '_')}")
++        cand.add_claim(ref, Evidence(
++            Tier.STRUCTURED_ID, f"wikidata:sitelink:{site}",
++            f"https://www.wikidata.org/wiki/{cand.entity_id}",
++            authoritative=True))
++
++
++# ---------------------------------------------------------------------------
++# gap fillers - called ONLY for platforms still missing
++# ---------------------------------------------------------------------------
++
++def fill_from_tmdb(cand: Candidate, fetch: Fetch, api_key: str) -> None:
++    """TMDB /external_ids: imdb + ig + x + tiktok + yt + fb in one request."""
++    tid = cand.external_ids.get("tmdb_person")
++    if not tid:
++        return
++    url = (f"https://api.themoviedb.org/3/person/{tid}/external_ids"
++           f"?api_key={api_key}")
++    data = fetch(url, kind="json") or {}
++    mapping = {
++        "imdb_id": Platform.IMDB,
++        "instagram_id": Platform.INSTAGRAM,
++        "twitter_id": Platform.TWITTER,
++        "tiktok_id": Platform.TIKTOK,
++        "youtube_id": Platform.YOUTUBE,
++        "facebook_id": Platform.FACEBOOK,
++    }
++    for field_name, plat in mapping.items():
++        val = data.get(field_name)
++        if not val or not isinstance(val, str):
++            continue
++        ref = PlatformRef(plat, val, "handle",
++                          canonical_url=build_url(plat, val))
++        cand.add_claim(ref, Evidence(
++            Tier.STRUCTURED_ID, f"tmdb:{field_name}",
++            f"https://www.themoviedb.org/person/{tid}",
++            authoritative=(plat is Platform.IMDB)))
++
++
++def fill_from_musicbrainz(cand: Candidate, fetch: Fetch) -> None:
++    """MusicBrainz url-rels: the best structured source for singers."""
++    mbid = cand.external_ids.get("musicbrainz_artist")
++    if not mbid:
++        return
++    url = (f"https://musicbrainz.org/ws/2/artist/{mbid}"
++           "?inc=url-rels&fmt=json")
++    data = fetch(url, kind="json") or {}
++    for rel in data.get("relations", []):
++        target = (rel.get("url") or {}).get("resource")
++        ref = classify_url(target or "")
++        if ref:
++            cand.add_claim(ref, Evidence(
++                Tier.STRUCTURED_ID, f"musicbrainz:{rel.get('type', 'url')}",
++                f"https://musicbrainz.org/artist/{mbid}"))
++
++
++# ---------------------------------------------------------------------------
++# bio-link cascade - the reverse path, where the real leverage is
++# ---------------------------------------------------------------------------
++
++def cascade_from_seed(cand: Candidate, seed_html: str, seed_url: str,
++                      fetch: Fetch, max_pages: int = 4) -> list[str]:
++    """
++    seed profile html -> outbound links -> aggregator pages -> harvest all.
++
++    Returns the aggregator urls visited, for provenance.
++    """
++    visited: list[str] = []
++
++    for u in extract_sameas(seed_html):
++        ref = classify_url(u)
++        if ref:
++            cand.add_claim(ref, Evidence(
++                Tier.SELF_DECLARED, "schema.org:sameAs", seed_url))
++
++    queue = []
++    for u in extract_links(seed_html):
++        if is_aggregator_url(u):
++            queue.append(u)
++
++    while queue and len(visited) < max_pages:
++        agg_url = queue.pop(0)
++        if agg_url in visited:
++            continue
++        visited.append(agg_url)
++        html = fetch(agg_url, kind="text") or ""
++        if not isinstance(html, str):
++            continue
++        for ref in harvest(html):
++            cand.add_claim(ref, Evidence(
++                Tier.SELF_DECLARED, "aggregator", agg_url,
++                detail=(is_aggregator_url(agg_url) or "").name
++                if is_aggregator_url(agg_url) else "generic"))
++
++    return visited
++
++
++def confirm_bidirectional(cand: Candidate, fetch: Fetch) -> None:
++    """
++    A links to B and B links to A. In practice this is the single most
++    reliable signal available, so it gets the heaviest weight.
++    """
++    keys = list(cand.claims.keys())
++    for k in keys:
++        claim = cand.claims[k]
++        if Tier.BIDIRECTIONAL in claim.tiers:
++            continue
++        url = claim.ref.canonical_url or build_url(claim.ref.platform,
++                                                   claim.ref.handle)
++        html = fetch(url, kind="text") or ""
++        if not isinstance(html, str) or not html:
++            continue
++        back = {r.key() for r in harvest(html)}
++        for other_key, other in cand.claims.items():
++            if other_key == k:
++                continue
++            if other_key in back:
++                cand.claims[other_key].add(Evidence(
++                    Tier.BIDIRECTIONAL, f"backlink_from:{claim.ref.platform.value}",
++                    url, detail=f"{claim.ref.platform.value} links to "
++                                f"{other.ref.platform.value}"))
++
++
++# ---------------------------------------------------------------------------
++# entity store - so effort compounds instead of repeating
++# ---------------------------------------------------------------------------
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS entity (
++    entity_id   TEXT PRIMARY KEY,
++    label       TEXT, description TEXT,
++    roles       TEXT, birth_year INTEGER,
++    external_ids TEXT, resolved_at TEXT
++);
++CREATE TABLE IF NOT EXISTS handle (
++    entity_id TEXT, platform TEXT, handle TEXT, lang TEXT,
++    id_kind TEXT, confidence REAL, verdict TEXT,
++    best_tier INTEGER, evidence TEXT, updated_at TEXT,
++    PRIMARY KEY (entity_id, platform, handle, lang)
++);
++CREATE TABLE IF NOT EXISTS collision (
++    name TEXT PRIMARY KEY, candidate_count INTEGER,
++    roles TEXT, first_seen TEXT, note TEXT
++);
++CREATE TABLE IF NOT EXISTS resolution_log (
++    name TEXT, role_hint TEXT, decision TEXT, winner TEXT,
++    margin REAL, at TEXT
++);
++CREATE INDEX IF NOT EXISTS idx_handle_lookup ON handle(platform, handle);
++"""
++
++
++class EntityStore:
++    """
++    Thread-safe by explicit lock, not by luck.
++
++    gunicorn runs threaded workers, so a connection created on the main thread
++    and used from a request thread raises. check_same_thread=False permits the
++    handoff; the lock is what actually makes it correct, since sqlite3 will
++    happily interleave writes from two threads and corrupt a transaction.
++    """
++
++    def __init__(self, path: str = "identityforge.db"):
++        self.conn = sqlite3.connect(path, check_same_thread=False)
++        self.conn.executescript(SCHEMA)
++        self.conn.commit()
++        self._lock = threading.RLock()
++
++    def known_collision(self, name: str) -> Optional[dict]:
++      with self._lock:
++        row = self.conn.execute(
++            "SELECT name, candidate_count, roles, note FROM collision "
++            "WHERE lower(name)=lower(?)", (name,)).fetchone()
++        if not row:
++            return None
++        return {"name": row[0], "candidate_count": row[1],
++                "roles": json.loads(row[2] or "[]"), "note": row[3]}
++
++    def record_collision(self, name: str, candidates: list[Candidate]) -> None:
++      with self._lock:
++        roles = sorted({r for c in candidates for r in c.roles})
++        self.conn.execute(
++            "INSERT OR REPLACE INTO collision VALUES (?,?,?,?,?)",
++            (name, len(candidates), json.dumps(roles),
++             _now(), "auto-detected during resolution"))
++        self.conn.commit()
++
++    def lookup_by_handle(self, platform: Platform, handle: str) -> Optional[str]:
++      with self._lock:
++        row = self.conn.execute(
++            "SELECT entity_id FROM handle WHERE platform=? AND lower(handle)=lower(?)",
++            (platform.value, handle)).fetchone()
++        return row[0] if row else None
++
++    def save(self, cand: Candidate) -> None:
++      with self._lock:
++        self.conn.execute(
++            "INSERT OR REPLACE INTO entity VALUES (?,?,?,?,?,?,?)",
++            (cand.entity_id, cand.label, cand.description,
++             json.dumps(cand.roles), cand.birth_year,
++             json.dumps(cand.external_ids), _now()))
++        for claim in cand.claims.values():
++            self.conn.execute(
++                "INSERT OR REPLACE INTO handle VALUES (?,?,?,?,?,?,?,?,?,?)",
++                (cand.entity_id, claim.ref.platform.value, claim.ref.handle,
++                 claim.ref.lang or "", claim.ref.id_kind, claim.confidence(),
++                 claim.verdict(),
++                 int(claim.best_tier) if claim.best_tier else 9,
++                 json.dumps([asdict(e) for e in claim.evidence]), _now()))
++        self.conn.commit()
++
++    def log(self, intake: Intake, result: dict) -> None:
++      with self._lock:
++        w = result.get("winner")
++        self.conn.execute(
++            "INSERT INTO resolution_log VALUES (?,?,?,?,?,?)",
++            (intake.name, intake.expected_role or "", result["decision"],
++             w.entity_id if w else "", result.get("margin"), _now()))
++        self.conn.commit()
++
++
++def _now() -> str:
++    return datetime.now(timezone.utc).isoformat(timespec="seconds")
++
++
++# ---------------------------------------------------------------------------
++# top-level entry point
++# ---------------------------------------------------------------------------
++
++def resolve(intake: Intake, fetch: Fetch, store: Optional[EntityStore] = None,
++            tmdb_key: str = "", do_bidirectional: bool = True) -> dict:
++    known = store.known_collision(intake.name) if store else None
++
++    candidates = discover_candidates(intake, fetch)
++    if store and len(candidates) > 1:
++        store.record_collision(intake.name, candidates)
++
++    decision = rank(candidates)
++    if store:
++        store.log(intake, decision)
++
++    if decision["decision"] != "resolved":
++        # Say which of the two very different problems this is: no hint given,
++        # or a hint given that nobody matches. They need opposite fixes.
++        if decision["decision"] == "disambiguate" and not intake.expected_role:
++            decision["reason"] = (
++                f"{len(decision['candidates'])} people share this name and no "
++                "role hint was supplied. Add an expected role and this usually "
++                "resolves on its own.")
++        return {
++            **decision,
++            "pre_flagged_collision": known,
++            "cards": [_card(c) for c in decision["candidates"][:6]],
++        }
++
++    cand: Candidate = decision["winner"]
++    harvest_structured_ids(cand, fetch)
++    if tmdb_key:
++        fill_from_tmdb(cand, fetch, tmdb_key)
++    fill_from_musicbrainz(cand, fetch)
++
++    # seed for the cascade: prefer a platform whose bio reliably carries a link
++    for plat in (Platform.INSTAGRAM, Platform.TWITTER, Platform.YOUTUBE,
++                 Platform.TIKTOK):
++        seed = next((c for c in cand.claims.values()
++                     if c.ref.platform is plat), None)
++        if seed:
++            url = seed.ref.canonical_url
++            html = fetch(url, kind="text")
++            if isinstance(html, str) and html:
++                cascade_from_seed(cand, html, url, fetch)
++            break
++
++    if do_bidirectional:
++        confirm_bidirectional(cand, fetch)
++
++    if store:
++        store.save(cand)
++
++    return {
++        "decision": "resolved",
++        "entity_id": cand.entity_id,
++        "label": cand.label,
++        "roles": cand.roles,
++        "margin": decision.get("margin"),
++        "external_ids": cand.external_ids,
++        "coverage": cand.coverage(TARGET_PLATFORMS),
++        "handles": {
++            plat.value: [
++                {"handle": c.ref.handle, "lang": c.ref.lang,
++                 "url": c.ref.canonical_url, "confidence": c.confidence(),
++                 "tiers": sorted(int(t) for t in c.tiers),
++                 "sources": [e.source for e in c.evidence]}
++                for c in claims
++            ] for plat, claims in cand.accepted().items()
++        },
++        "needs_review": [
++            {"platform": c.ref.platform.value, "handle": c.ref.handle,
++             "confidence": c.confidence(),
++             "sources": [e.source for e in c.evidence]}
++            for c in cand.claims.values() if c.verdict() == "review"
++        ],
++    }
++
++
++def _card(c: Candidate) -> dict:
++    """Payload for the human disambiguation card - 3 seconds to decide."""
++    return {
++        "entity_id": c.entity_id,
++        "label": c.label,
++        "description": c.description,
++        "roles": c.roles,
++        "born": c.birth_year,
++        "died": c.death_year,
++        "thumbnail": c.thumbnail,
++        "role_score": c.role_score,
++        "id_count": len(c.external_ids),
++        "wikidata": f"https://www.wikidata.org/wiki/{c.entity_id}",
++    }
+diff --git a/render.yaml b/render.yaml
+new file mode 100644
+index 0000000..bc82935
+--- /dev/null
++++ b/render.yaml
+@@ -0,0 +1,26 @@
++services:
++  - type: web
++    name: talent-social-finder
++    runtime: python
++    plan: free
++    buildCommand: pip install -r requirements.txt
++    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
++    healthCheckPath: /api/health
++    envVars:
++      # Demo mode by default. Set IF_LIVE=1 in the Render dashboard only once
++      # you have reviewed the rate-limiting policy in identityforge/fetcher.py.
++      - key: IF_LIVE
++        value: "0"
++      - key: PYTHON_VERSION
++        value: "3.12.4"
++      # Set in the dashboard, never in this file.
++      - key: TMDB_API_KEY
++        sync: false
++      # Render's free tier has an ephemeral filesystem: the SQLite entity store
++      # and HTTP cache are wiped on every deploy and on cold start. Fine for
++      # evaluation. For the compounding entity store to actually compound,
++      # attach a disk (paid) or point these at Postgres.
++      - key: IF_DB_PATH
++        value: "/tmp/identityforge.db"
++      - key: IF_CACHE_PATH
++        value: "/tmp/http_cache.db"
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..bdb61ec
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,2 @@
++Flask==3.0.3
++gunicorn==22.0.0
+diff --git a/runtime.txt b/runtime.txt
+new file mode 100644
+index 0000000..74d315a
+--- /dev/null
++++ b/runtime.txt
+@@ -0,0 +1 @@
++python-3.12.4
+diff --git a/templates/index.html b/templates/index.html
+new file mode 100644
+index 0000000..6b37d6a
+--- /dev/null
++++ b/templates/index.html
+@@ -0,0 +1,325 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>IdentityForge — talent social handle resolver</title>
++<link rel="preconnect" href="https://fonts.googleapis.com">
++<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
++<style>
++:root{
++  --ink:#16243F; --ink-deep:#0D1729; --ink-soft:#41506B;
++  --paper:#F4F6F9; --card:#FFFFFF; --rule:#D9E0EA;
++  --accept:#0B6E52; --review:#96610A; --reject:#93312C;
++  --structured:#33449C; --muted:#7B879C;
++  --shadow:0 1px 2px rgba(13,23,41,.06),0 8px 24px rgba(13,23,41,.05);
++}
++*{box-sizing:border-box}
++body{margin:0;background:var(--paper);color:var(--ink);
++  font:400 15px/1.55 "IBM Plex Sans",system-ui,sans-serif;
++  -webkit-font-smoothing:antialiased}
++.mono{font-family:"IBM Plex Mono",ui-monospace,monospace}
++a{color:var(--structured)}
++
++/* ---------- masthead ---------- */
++header{background:var(--ink);color:#fff;padding:34px 24px 30px}
++.wrap{max-width:1000px;margin:0 auto}
++.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:11px;
++  letter-spacing:.14em;text-transform:uppercase;color:#8DA0C4}
++h1{font-family:Newsreader,Georgia,serif;font-weight:400;
++  font-size:clamp(30px,5vw,44px);line-height:1.06;margin:10px 0 8px;
++  letter-spacing:-.01em}
++h1 em{font-style:italic;color:#A8BEE4}
++.sub{color:#B6C4DC;max-width:60ch;margin:0}
++.mode{display:inline-block;margin-top:16px;padding:4px 10px;border-radius:2px;
++  font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.08em;
++  text-transform:uppercase;border:1px solid rgba(255,255,255,.28);color:#CBD8EC}
++.mode.live{background:#0B6E52;border-color:#0B6E52;color:#fff}
++
++/* ---------- query bar ---------- */
++main{max-width:1000px;margin:0 auto;padding:0 24px 80px}
++.panel{background:var(--card);border:1px solid var(--rule);border-radius:3px;
++  box-shadow:var(--shadow);margin-top:-18px;padding:22px}
++.grid{display:grid;gap:14px;grid-template-columns:2fr 1fr 1fr}
++@media(max-width:720px){.grid{grid-template-columns:1fr}}
++label{display:block;font-size:11px;letter-spacing:.1em;text-transform:uppercase;
++  font-family:"IBM Plex Mono",monospace;color:var(--ink-soft);margin-bottom:6px}
++input,select{width:100%;padding:10px 11px;font:400 15px/1.4 "IBM Plex Sans",sans-serif;
++  color:var(--ink);background:#FCFDFE;border:1px solid var(--rule);border-radius:2px}
++input:focus,select:focus{outline:2px solid var(--structured);outline-offset:1px;
++  border-color:var(--structured)}
++.row2{display:flex;gap:14px;align-items:flex-end;margin-top:14px;flex-wrap:wrap}
++.row2 .field{flex:1;min-width:180px}
++button{font:500 15px "IBM Plex Sans",sans-serif;padding:11px 22px;
++  background:var(--ink);color:#fff;border:0;border-radius:2px;cursor:pointer}
++button:hover{background:var(--ink-deep)}
++button:disabled{background:var(--muted);cursor:default}
++button:focus-visible{outline:2px solid var(--structured);outline-offset:2px}
++.hint{font-size:13px;color:var(--ink-soft);margin:12px 0 0}
++.hint code{font-family:"IBM Plex Mono",monospace;font-size:12px;
++  background:var(--paper);padding:1px 5px;border-radius:2px}
++
++/* ---------- results ---------- */
++section{margin-top:34px}
++.decision{border-left:3px solid var(--structured);padding:14px 18px;
++  background:var(--card);border:1px solid var(--rule);border-left-width:3px;
++  border-radius:3px;box-shadow:var(--shadow)}
++.decision.disambiguate{border-left-color:var(--review)}
++.decision.not_found{border-left-color:var(--reject)}
++.decision h2{font-family:Newsreader,serif;font-weight:400;font-size:23px;
++  margin:0 0 4px}
++.decision p{margin:0;color:var(--ink-soft);font-size:14px}
++
++h3{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.14em;
++  text-transform:uppercase;color:var(--ink-soft);margin:30px 0 12px;
++  padding-bottom:8px;border-bottom:1px solid var(--rule)}
++
++/* handle rows */
++.handle{background:var(--card);border:1px solid var(--rule);border-radius:3px;
++  padding:14px 16px;margin-bottom:8px;display:grid;gap:4px 16px;
++  grid-template-columns:132px 1fr auto;align-items:center;
++  animation:rise .32s ease both}
++@media(max-width:640px){.handle{grid-template-columns:1fr}}
++@keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
++@media(prefers-reduced-motion:reduce){.handle{animation:none}}
++.plat{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.1em;
++  text-transform:uppercase;color:var(--ink-soft)}
++.hval{font-family:"IBM Plex Mono",monospace;font-size:14.5px;word-break:break-all}
++.hval a{text-decoration:none;border-bottom:1px solid #C3CDDF}
++.conf{font-family:"IBM Plex Mono",monospace;font-size:13px;text-align:right;
++  white-space:nowrap}
++.conf.accept{color:var(--accept)} .conf.review{color:var(--review)}
++
++/* SIGNATURE: the tier ledger — five fixed slots, so you can see at a glance
++   WHY a handle was accepted, not just that it was. */
++.ledger{grid-column:1/-1;display:flex;gap:3px;margin-top:9px;align-items:center}
++.tier{width:44px;height:20px;border:1px solid var(--rule);border-radius:1px;
++  display:flex;align-items:center;justify-content:center;
++  font-family:"IBM Plex Mono",monospace;font-size:10px;color:#B9C2D2;
++  background:#FBFCFD}
++.tier.on{color:#fff;border-color:transparent}
++.tier.t1{background:var(--structured)} .tier.t2{background:#5B7FB8}
++.tier.t3{background:var(--accept)}     .tier.t4{background:#8A94A8}
++.tier.t5{background:var(--reject)}
++.ledger .why{font-size:12px;color:var(--muted);margin-left:10px}
++
++/* candidate cards */
++.cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(258px,1fr))}
++.cardx{background:var(--card);border:1px solid var(--rule);border-radius:3px;
++  padding:16px;box-shadow:var(--shadow)}
++.cardx .qid{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted)}
++.cardx .nm{font-family:Newsreader,serif;font-size:20px;margin:3px 0 6px}
++.cardx .desc{font-size:13.5px;color:var(--ink-soft);min-height:38px}
++.cardx dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;
++  margin:12px 0 0;font-size:12.5px}
++.cardx dt{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
++  letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
++.cardx dd{margin:0}
++.pill{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:10.5px;
++  letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:2px;
++  background:#EDF1F7;color:var(--ink-soft);margin:0 4px 4px 0}
++.pill.win{background:var(--accept);color:#fff}
++
++table{width:100%;border-collapse:collapse;background:var(--card);
++  border:1px solid var(--rule);border-radius:3px;font-size:13.5px}
++th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--rule)}
++th{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.1em;
++  text-transform:uppercase;color:var(--ink-soft);font-weight:400}
++tr:last-child td{border-bottom:0}
++td.k{font-family:"IBM Plex Mono",monospace;color:var(--ink-soft)}
++td.v{font-family:"IBM Plex Mono",monospace;word-break:break-all}
++
++.empty{color:var(--ink-soft);font-size:14px;background:var(--card);
++  border:1px dashed var(--rule);border-radius:3px;padding:18px}
++.err{border-left:3px solid var(--reject);background:#FDF6F5;padding:14px 18px;
++  border-radius:3px;font-size:14px}
++footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
++  font-size:12.5px;color:var(--muted)}
++.spin{display:inline-block;width:13px;height:13px;border:2px solid #fff;
++  border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;
++  vertical-align:-2px;margin-right:8px}
++@keyframes sp{to{transform:rotate(360deg)}}
++</style>
++</head>
++<body>
++
++<header>
++  <div class="wrap">
++    <div class="eyebrow">ListenFirst · Data Operations</div>
++    <h1>Resolve the <em>person</em>,<br>not the name.</h1>
++    <p class="sub">Six people share a name. One is the singer you need. IdentityForge
++      enumerates every human with that name from a structured identity graph, filters
++      by role, then harvests handles from anchors the person declared themselves.</p>
++    <span class="mode {{ 'live' if live else '' }}">{{ 'live mode' if live else 'demo mode — fixtures only' }}</span>
++  </div>
++</header>
++
++<main>
++  <div class="panel">
++    <div class="grid">
++      <div>
++        <label for="name">Name</label>
++        <input id="name" value="Michael Jackson" autocomplete="off"
++               placeholder="e.g. A. R. Rahman">
++      </div>
++      <div>
++        <label for="role">Expected role</label>
++        <select id="role">
++          <option value="">— unknown —</option>
++          {% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
++        </select>
++      </div>
++      <div>
++        <label for="year">Active year</label>
++        <input id="year" inputmode="numeric" placeholder="2005">
++      </div>
++    </div>
++    <div class="row2">
++      <div class="field">
++        <label for="ctx">Context (show, brand, campaign)</label>
++        <input id="ctx" placeholder="Sony Music catalogue" autocomplete="off">
++      </div>
++      <button id="go">Resolve handles</button>
++    </div>
++    <p class="hint">Role comes free from your ingest data — <code>title_category</code>
++      already implies it. Leave it unknown to see what happens on a collision.</p>
++  </div>
++
++  <div id="out"></div>
++
++  <footer>
++    Read-only. Evidence tiers: <span class="mono">T1</span> structured ID ·
++    <span class="mono">T2</span> self-declared · <span class="mono">T3</span> bidirectional ·
++    <span class="mono">T4</span> corroborating · <span class="mono">T5</span> name match.
++    A name match alone never resolves a handle.
++  </footer>
++</main>
++
++<script>
++const $ = s => document.querySelector(s);
++const out = $("#out");
++const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
++  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
++
++const TIER_NAME = {1:"structured ID",2:"self-declared",3:"bidirectional",
++                   4:"corroborating",5:"name match"};
++
++function ledger(tiers, sources){
++  const on = new Set(tiers || []);
++  let html = '<div class="ledger">';
++  for (let t=1;t<=5;t++)
++    html += `<span class="tier t${t} ${on.has(t)?"on":""}" title="T${t} ${TIER_NAME[t]}">T${t}</span>`;
++  const why = (sources||[]).slice(0,3).join(" · ");
++  html += `<span class="why">${esc(why)}</span></div>`;
++  return html;
++}
++
++function handleRow(plat, h, verdict){
++  const url = h.url || "";
++  const lang = h.lang ? ` <span class="plat">${esc(h.lang)}</span>` : "";
++  return `<div class="handle">
++    <div class="plat">${esc(plat)}</div>
++    <div class="hval">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener nofollow">${esc(h.handle)}</a>` : esc(h.handle)}${lang}</div>
++    <div class="conf ${verdict}">${(h.confidence ?? 0).toFixed(2)}</div>
++    ${ledger(h.tiers, h.sources)}
++  </div>`;
++}
++
++function render(d){
++  if (d.error){ out.innerHTML = `<section><div class="err"><strong>${esc(d.error)}</strong>${d.detail?"<br>"+esc(d.detail):""}</div></section>`; return; }
++  let html = "";
++
++  if (d.decision === "resolved"){
++    html += `<section><div class="decision">
++      <h2>${esc(d.label)} <span class="qid mono">${esc(d.entity_id)}</span></h2>
++      <p>Resolved on role match${d.margin!=null?` with a margin of ${d.margin}`:""}.
++         Roles: ${esc((d.roles||[]).join(", ")||"—")}.
++         Platform coverage ${Math.round((d.coverage||0)*100)}% of 8.</p>
++    </div></section>`;
++
++    const accepted = d.handles || {};
++    const platKeys = Object.keys(accepted);
++    html += `<section><h3>Accepted handles</h3>`;
++    html += platKeys.length
++      ? platKeys.sort().map(p => accepted[p].map(h => handleRow(p,h,"accept")).join("")).join("")
++      : `<div class="empty">Nothing cleared the 0.75 threshold.</div>`;
++    html += `</section>`;
++
++    if ((d.needs_review||[]).length){
++      html += `<section><h3>Needs one click to confirm</h3>`;
++      html += d.needs_review.map(r => handleRow(r.platform,
++        {handle:r.handle, confidence:r.confidence, tiers:r.tiers, sources:r.sources},
++        "review")).join("");
++      html += `<p class="hint">Single-source and self-declared only. Confirming one
++        of these promotes it to accepted and teaches the store.</p></section>`;
++    }
++
++    const ids = d.external_ids || {};
++    const idk = Object.keys(ids);
++    if (idk.length){
++      html += `<section><h3>Spoke IDs harvested from the hub — ${idk.length} in one call</h3>
++        <table><thead><tr><th>Authority</th><th>Identifier</th></tr></thead><tbody>`;
++      html += idk.sort().map(k => `<tr><td class="k">${esc(k)}</td><td class="v">${esc(ids[k])}</td></tr>`).join("");
++      html += `</tbody></table></section>`;
++    }
++  } else if (d.decision === "disambiguate"){
++    html += `<section><div class="decision disambiguate">
++      <h2>Collision — pick the right person</h2>
++      <p>${esc(d.reason || "Top candidates are too close to separate automatically.")}
++         Refusing to guess is the point: a wrong handle in a deliverable costs more
++         than one click.</p></div></section>`;
++    html += `<section><h3>${(d.cards||[]).length} candidates share this name</h3><div class="cards">`;
++    html += (d.cards||[]).map((c,i) => `<div class="cardx">
++        <div class="qid">${esc(c.entity_id)}</div>
++        <div class="nm">${esc(c.label)}</div>
++        <div class="desc">${esc(c.description||"No description on record.")}</div>
++        <div style="margin-top:10px">${(c.roles||[]).map(r=>`<span class="pill ${i===0&&c.role_score>0?"win":""}">${esc(r)}</span>`).join("")||'<span class="pill">role unknown</span>'}</div>
++        <dl>
++          <dt>Lived</dt><dd>${c.born??"?"}${c.died?" – "+c.died:""}</dd>
++          <dt>IDs</dt><dd>${c.id_count}</dd>
++          <dt>Score</dt><dd class="mono">${c.role_score}</dd>
++          <dt>Source</dt><dd><a href="${esc(c.wikidata)}" target="_blank" rel="noopener">Wikidata</a></dd>
++        </dl></div>`).join("");
++    html += `</div></section>`;
++  } else {
++    html += `<section><div class="decision not_found"><h2>No candidates</h2>
++      <p>No human with that exact label or alias in the identity graph. Label
++         matching is exact and case-sensitive, so try the spelling used on the
++         person's Wikipedia article, or fall back to handle probing.</p>
++    </div></section>`;
++  }
++
++  const fs = d.fetch_stats || {};
++  html += `<section><h3>Run</h3><table><tbody>
++    <tr><td class="k">mode</td><td class="v">${esc(d.mode||"")}</td></tr>` +
++    Object.keys(fs).map(k=>`<tr><td class="k">${esc(k)}</td><td class="v">${esc(fs[k])}</td></tr>`).join("") +
++    `</tbody></table></section>`;
++
++  out.innerHTML = html;
++}
++
++async function run(){
++  const btn = $("#go");
++  btn.disabled = true;
++  const label = btn.textContent;
++  btn.innerHTML = '<span class="spin"></span>Resolving';
++  out.innerHTML = "";
++  try{
++    const r = await fetch("/api/resolve", {
++      method:"POST", headers:{"Content-Type":"application/json"},
++      body: JSON.stringify({name:$("#name").value, role:$("#role").value,
++        active_year:$("#year").value, context:$("#ctx").value})
++    });
++    render(await r.json());
++  }catch(e){
++    out.innerHTML = `<section><div class="err"><strong>Could not reach the resolver.</strong><br>${esc(e.message)}</div></section>`;
++  }finally{
++    btn.disabled = false; btn.textContent = label;
++  }
++}
++$("#go").addEventListener("click", run);
++$("#name").addEventListener("keydown", e => { if(e.key==="Enter") run(); });
++</script>
++</body>
++</html>
+diff --git a/tests/test_all.py b/tests/test_all.py
+new file mode 100644
+index 0000000..94a3ddd
+--- /dev/null
++++ b/tests/test_all.py
+@@ -0,0 +1,283 @@
++"""Offline test suite - no network. Fixtures stand in for live pages."""
++import json
++import sys
++import os
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from identityforge.platforms import Platform, classify_url, build_url
++from identityforge.aggregators import (harvest, probe_urls, is_aggregator_url,
++                                       looks_like_aggregator, extract_sameas)
++from identityforge.evidence import (Candidate, Evidence, HandleClaim, Tier,
++                                    rank, score_role_match)
++from identityforge.platforms import PlatformRef
++from identityforge.resolver import Intake, EntityStore, resolve
++from identityforge import authorities
++
++PASS = FAIL = 0
++
++
++def check(label, got, want):
++    global PASS, FAIL
++    if got == want:
++        PASS += 1
++        print(f"  ok   {label}")
++    else:
++        FAIL += 1
++        print(f"  FAIL {label}\n         got  {got!r}\n         want {want!r}")
++
++
++print("\n=== 1. URL classification / normalisation ===")
++cases = [
++    ("https://www.instagram.com/taylorswift/?hl=en&utm_source=x",
++     (Platform.INSTAGRAM, "taylorswift")),
++    ("instagram.com/@nickjonas", (Platform.INSTAGRAM, "nickjonas")),
++    ("https://m.facebook.com/ARRahman", (Platform.FACEBOOK, "ARRahman")),
++    ("https://www.facebook.com/profile.php?id=100044512345678&sk=about",
++     (Platform.FACEBOOK, "100044512345678")),
++    ("https://twitter.com/iHrithik", (Platform.TWITTER, "iHrithik")),
++    ("https://x.com/i/user/1234567890", (Platform.TWITTER, "1234567890")),
++    ("https://www.youtube.com/@MrBeast", (Platform.YOUTUBE, "MrBeast")),
++    ("https://youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA",
++     (Platform.YOUTUBE, "UCX6OQ3DkcsbYNE6H8uQQuVA")),
++    ("https://www.youtube.com/c/tseries", (Platform.YOUTUBE, "tseries")),
++    ("https://www.tiktok.com/@charlidamelio?lang=en",
++     (Platform.TIKTOK, "charlidamelio")),
++    ("https://www.linkedin.com/in/satyanadella/", (Platform.LINKEDIN, "satyanadella")),
++    ("https://www.imdb.com/name/nm0000138/?ref_=nv_sr_1",
++     (Platform.IMDB, "nm0000138")),
++    ("https://hi.wikipedia.org/wiki/%E0%A4%B6%E0%A4%BE%E0%A4%B9%E0%A4%B0%E0%A5%81%E0%A4%96%E0%A4%BC_%E0%A4%96%E0%A4%BC%E0%A4%BE%E0%A4%A8",
++     (Platform.WIKIPEDIA, "शाहरुख़ ख़ान")),
++]
++for url, want in cases:
++    ref = classify_url(url)
++    check(url[:52], (ref.platform, ref.handle) if ref else None, want)
++
++print("\n  -- must be rejected (routes, not identities) --")
++for url in ["https://www.instagram.com/p/Cabc123/",
++            "https://twitter.com/i/status/1",
++            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
++            "https://www.tiktok.com/tag/bollywood",
++            "https://www.linkedin.com/feed/",
++            "https://www.facebook.com/groups/12345",
++            "https://en.wikipedia.org/wiki/Category:Actors",
++            "https://youtu.be/dQw4w9WgXcQ",
++            "https://www.imdb.com/title/tt0111161/"]:
++    check(url[:52], classify_url(url), None)
++
++print("\n  -- lang + canonical url --")
++w = classify_url("https://ta.wikipedia.org/wiki/A._R._Rahman")
++check("wikipedia lang", w.lang, "ta")
++check("wikipedia canonical", w.canonical_url,
++      "https://ta.wikipedia.org/wiki/A._R._Rahman")
++check("twitter canonicalises to x.com",
++      classify_url("https://twitter.com/foo").canonical_url, "https://x.com/foo")
++check("build_url roundtrip",
++      classify_url(build_url(Platform.TIKTOK, "@abc")).handle, "abc")
++check("linkedin company flagged not person",
++      classify_url("https://www.linkedin.com/company/netflix/").id_kind, "company")
++
++
++print("\n=== 2. Aggregator harvesting ===")
++LINKTREE = """
++<html><head><title>@arrahman | Linktree</title></head><body>
++<script id="__NEXT_DATA__" type="application/json">
++%s
++</script>
++<a href="https://open.spotify.com/artist/1mYsTxnqsietFxj1OgoGbG">Spotify</a>
++</body></html>
++""" % json.dumps({
++    "props": {"pageProps": {"account": {"username": "arrahman"}, "links": [
++        {"title": "Instagram", "url": "https://instagram.com/arrahman?igshid=xx"},
++        {"title": "X", "url": "https://twitter.com/arrahman"},
++        {"title": "YouTube", "url": "https://www.youtube.com/@ARRahmanOfficial"},
++        {"title": "Facebook", "url": "https://www.facebook.com/ARRahman"},
++        {"title": "TikTok", "url": "https://www.tiktok.com/@arrahman"},
++        {"title": "New single", "url": "https://ffm.to/newsingle"},
++        {"title": "Store", "url": "https://shop.example.com"},
++    ]}}})
++
++refs = harvest(LINKTREE)
++found = {(r.platform, r.handle) for r in refs}
++check("linktree platform count", len({p for p, _ in found}), 5)
++check("instagram tracking stripped", (Platform.INSTAGRAM, "arrahman") in found, True)
++check("youtube handle harvested",
++      (Platform.YOUTUBE, "ARRahmanOfficial") in found, True)
++check("smartlink not misread as identity",
++      any("ffm.to" in (r.raw_url or "") for r in refs), False)
++
++check("linktr.ee recognised", is_aggregator_url("https://linktr.ee/x").name, "Linktree")
++check("subdomain carrd recognised",
++      is_aggregator_url("https://someone.carrd.co").name, "Carrd")
++check("random domain not aggregator", is_aggregator_url("https://bbc.co.uk"), None)
++check("probe set size", len(probe_urls("arrahman")), len(__import__("identityforge.aggregators", fromlist=["AGGREGATORS"]).AGGREGATORS))
++check("probe rejects junk handle", probe_urls("a b/c"), [])
++check("generic aggregator heuristic", looks_like_aggregator(LINKTREE), True)
++
++SAMEAS = """<script type="application/ld+json">
++{"@type":"Person","name":"A. R. Rahman","sameAs":[
++"https://twitter.com/arrahman","https://www.imdb.com/name/nm0006249/"]}
++</script>"""
++check("sameAs extracted", len(extract_sameas(SAMEAS)), 2)
++
++
++print("\n=== 3. Confidence model ===")
++ig = PlatformRef(Platform.INSTAGRAM, "arrahman")
++c1 = HandleClaim(ig).add(Evidence(Tier.NAME_MATCH, "name"))
++check("name match alone -> reject", c1.verdict(), "reject")
++
++c2 = HandleClaim(ig).add(Evidence(Tier.SELF_DECLARED, "linktr.ee/arrahman"))
++check("self-declared alone -> review", c2.verdict(), "review")
++
++c3 = (HandleClaim(ig)
++      .add(Evidence(Tier.STRUCTURED_ID, "wikidata:P2003"))
++      .add(Evidence(Tier.SELF_DECLARED, "linktr.ee/arrahman")))
++check("structured + self-declared -> accept", c3.verdict(), "accept")
++
++c4 = (HandleClaim(ig)
++      .add(Evidence(Tier.BIDIRECTIONAL, "backlink"))
++      .add(Evidence(Tier.STRUCTURED_ID, "wikidata:P2003"))
++      .add(Evidence(Tier.SELF_DECLARED, "linktr.ee")))
++check("three tiers -> high confidence", c4.confidence() > 0.85, True)
++check("monotonic in evidence", c4.confidence() > c3.confidence() > c2.confidence(), True)
++
++
++print("\n=== 4. Role disambiguation (the actual problem) ===")
++# 'Michael Jackson' - singer / footballer / writer, all real collisions
++singer = Candidate("Q2831", "Michael Jackson", "American singer",
++                   occupations=["Q177220"], roles=["musician"], birth_year=1958,
++                   death_year=2009, external_ids={"spotify_artist": "3fMbdgg4jU18AjLCKBhRSm"})
++footballer = Candidate("Q6831397", "Michael Jackson", "English footballer",
++                       occupations=["Q937857"], roles=["athlete"], birth_year=1973)
++writer = Candidate("Q1928447", "Michael Jackson", "British beer writer",
++                   occupations=["Q36180"], roles=["writer"], birth_year=1942,
++                   death_year=2007)
++pool = [singer, footballer, writer]
++
++for c in pool:
++    score_role_match(c, "musician", expected_active_year=2005)
++r = rank(pool)
++check("musician hint resolves", r["decision"], "resolved")
++check("correct winner", r["winner"].entity_id, "Q2831")
++
++for c in pool:
++    score_role_match(c, "athlete", expected_active_year=2000)
++r = rank(pool)
++check("athlete hint resolves", r["decision"], "resolved")
++check("correct winner", r["winner"].entity_id, "Q6831397")
++
++for c in pool:
++    score_role_match(c, None)
++r = rank(pool)
++check("no hint -> disambiguate not guess", r["decision"], "disambiguate")
++
++for c in pool:
++    score_role_match(c, "politician")
++r = rank(pool)
++check("wrong-vertical hint -> disambiguate", r["decision"], "disambiguate")
++
++score_role_match(singer, "musician", expected_active_year=2020)   # after death
++check("dead-at-time penalised", singer.role_score < 0.5, True)
++
++
++print("\n=== 5. End-to-end with a fake network ===")
++FIXTURES = {
++    "sparql": {"results": {"bindings": [
++        {"p": {"value": "http://www.wikidata.org/entity/Q2831"},
++         "pLabel": {"value": "Michael Jackson"},
++         "pDesc": {"value": "American singer (1958-2009)"},
++         "occ": {"value": "http://www.wikidata.org/entity/Q177220"},
++         "dob": {"value": "1958-08-29T00:00:00Z"},
++         "dod": {"value": "2009-06-25T00:00:00Z"}},
++        {"p": {"value": "http://www.wikidata.org/entity/Q6831397"},
++         "pLabel": {"value": "Michael Jackson"},
++         "pDesc": {"value": "English footballer"},
++         "occ": {"value": "http://www.wikidata.org/entity/Q937857"},
++         "dob": {"value": "1973-01-01T00:00:00Z"}},
++    ]}},
++    "entity": {"entities": {"Q2831": {
++        "claims": {
++            "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++            "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++            "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
++            "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
++            "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
++            "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
++        },
++        "sitelinks": {"enwiki": {"title": "Michael Jackson"},
++                      "hiwiki": {"title": "माइकल जैक्सन"}},
++    }}},
++    "ig_profile": '<html><body><a href="https://linktr.ee/michaeljackson">bio</a></body></html>',
++    "linktree": LINKTREE.replace("arrahman", "michaeljackson")
++                        .replace("ARRahman", "michaeljackson")
++                        .replace("ARRahmanOfficial", "michaeljackson"),
++    "mb": {"relations": [
++        {"type": "social network",
++         "url": {"resource": "https://www.tiktok.com/@michaeljackson"}}]},
++}
++
++calls = []
++
++
++def fake_fetch(url, kind="text"):
++    calls.append(url)
++    if "sparql" in url:
++        return FIXTURES["sparql"]
++    if "wbgetentities" in url:
++        return FIXTURES["entity"]
++    if "musicbrainz.org/ws" in url:
++        return FIXTURES["mb"]
++    if "instagram.com" in url:
++        return FIXTURES["ig_profile"]
++    if "linktr.ee" in url:
++        return FIXTURES["linktree"]
++    return "" if kind == "text" else {}
++
++
++store = EntityStore(":memory:")
++res = resolve(Intake("Michael Jackson", expected_role="musician",
++                     active_year=2005, context="Sony Music catalogue"),
++              fake_fetch, store, do_bidirectional=False)
++
++check("e2e resolved", res["decision"], "resolved")
++check("e2e right person", res["entity_id"], "Q2831")
++check("spotify id harvested via hub",
++      res["external_ids"].get("spotify_artist"), "3fMbdgg4jU18AjLCKBhRSm")
++check("musicbrainz id harvested",
++      "musicbrainz_artist" in res["external_ids"], True)
++got = set(res["handles"].keys())
++print(f"       platforms accepted: {sorted(got)}")
++check("instagram accepted", "instagram" in got, True)
++check("imdb accepted", "imdb" in got, True)
++check("wikipedia multi-lang", len(res["handles"]["wikipedia"]), 2)
++check("tiktok via musicbrainz+linktree", "tiktok" in got, True)
++# Facebook + YouTube came ONLY from the Linktree -> self-declared, single
++# source -> must land in review, NOT auto-accept. Coverage is 5/8 and that is
++# the correct answer, not a shortfall.
++check("coverage is 5/8", res["coverage"], 0.625)
++review = {r["platform"] for r in res["needs_review"]}
++check("aggregator-only facebook -> review", "facebook" in review, True)
++check("aggregator-only youtube -> review", "youtube" in review, True)
++check("linkedin genuinely absent, not invented",
++      "linkedin" in res["handles"] or "linkedin" in review, False)
++check("collision was recorded",
++      store.known_collision("michael jackson")["candidate_count"], 2)
++check("reverse lookup by handle",
++      store.lookup_by_handle(Platform.INSTAGRAM, "MichaelJackson"), "Q2831")
++
++print("\n  -- ambiguous intake must NOT auto-guess --")
++res2 = resolve(Intake("Michael Jackson"), fake_fetch, EntityStore(":memory:"))
++check("no hint -> disambiguate", res2["decision"], "disambiguate")
++check("cards rendered for human", len(res2["cards"]), 2)
++check("cards carry occupation", res2["cards"][0]["roles"] != [], True)
++
++
++print("\n=== 6. Property-map self-audit ===")
++unver = authorities.unverified_properties()
++print(f"       {len(unver)} P-numbers flagged for runtime validation:")
++for a in unver:
++    print(f"         {a.wikidata_prop:<7} {a.key}")
++check("audit list non-empty (honest about uncertainty)", len(unver) > 0, True)
++
++print(f"\n{'='*54}\n  {PASS} passed, {FAIL} failed\n{'='*54}")
++sys.exit(1 if FAIL else 0)
+-- 
+2.43.0
+
