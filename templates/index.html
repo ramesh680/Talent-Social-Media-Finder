@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IdentityForge — talent social handle resolver</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#16243F; --ink-deep:#0D1729; --ink-soft:#41506B;
+  --paper:#F4F6F9; --card:#FFFFFF; --rule:#D9E0EA;
+  --accept:#0B6E52; --review:#96610A; --reject:#93312C;
+  --structured:#33449C; --muted:#7B879C;
+  --shadow:0 1px 2px rgba(13,23,41,.06),0 8px 24px rgba(13,23,41,.05);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font:400 15px/1.55 "IBM Plex Sans",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.mono{font-family:"IBM Plex Mono",ui-monospace,monospace}
+a{color:var(--structured)}
+
+/* ---------- masthead ---------- */
+header{background:var(--ink);color:#fff;padding:34px 24px 30px}
+.wrap{max-width:1000px;margin:0 auto}
+.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:11px;
+  letter-spacing:.14em;text-transform:uppercase;color:#8DA0C4}
+h1{font-family:Newsreader,Georgia,serif;font-weight:400;
+  font-size:clamp(30px,5vw,44px);line-height:1.06;margin:10px 0 8px;
+  letter-spacing:-.01em}
+h1 em{font-style:italic;color:#A8BEE4}
+.sub{color:#B6C4DC;max-width:60ch;margin:0}
+.mode{display:inline-block;margin-top:16px;padding:4px 10px;border-radius:2px;
+  font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.08em;
+  text-transform:uppercase;border:1px solid rgba(255,255,255,.28);color:#CBD8EC}
+.mode.live{background:#0B6E52;border-color:#0B6E52;color:#fff}
+
+/* ---------- query bar ---------- */
+main{max-width:1000px;margin:0 auto;padding:0 24px 80px}
+.panel{background:var(--card);border:1px solid var(--rule);border-radius:3px;
+  box-shadow:var(--shadow);margin-top:-18px;padding:22px}
+.grid{display:grid;gap:14px;grid-template-columns:2fr 1fr 1fr}
+@media(max-width:720px){.grid{grid-template-columns:1fr}}
+label{display:block;font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+  font-family:"IBM Plex Mono",monospace;color:var(--ink-soft);margin-bottom:6px}
+input,select{width:100%;padding:10px 11px;font:400 15px/1.4 "IBM Plex Sans",sans-serif;
+  color:var(--ink);background:#FCFDFE;border:1px solid var(--rule);border-radius:2px}
+input:focus,select:focus{outline:2px solid var(--structured);outline-offset:1px;
+  border-color:var(--structured)}
+.row2{display:flex;gap:14px;align-items:flex-end;margin-top:14px;flex-wrap:wrap}
+.row2 .field{flex:1;min-width:180px}
+button{font:500 15px "IBM Plex Sans",sans-serif;padding:11px 22px;
+  background:var(--ink);color:#fff;border:0;border-radius:2px;cursor:pointer}
+button:hover{background:var(--ink-deep)}
+button:disabled{background:var(--muted);cursor:default}
+button:focus-visible{outline:2px solid var(--structured);outline-offset:2px}
+.hint{font-size:13px;color:var(--ink-soft);margin:12px 0 0}
+.hint code{font-family:"IBM Plex Mono",monospace;font-size:12px;
+  background:var(--paper);padding:1px 5px;border-radius:2px}
+
+/* ---------- results ---------- */
+section{margin-top:34px}
+.decision{border-left:3px solid var(--structured);padding:14px 18px;
+  background:var(--card);border:1px solid var(--rule);border-left-width:3px;
+  border-radius:3px;box-shadow:var(--shadow)}
+.decision.disambiguate{border-left-color:var(--review)}
+.decision.not_found{border-left-color:var(--reject)}
+.decision h2{font-family:Newsreader,serif;font-weight:400;font-size:23px;
+  margin:0 0 4px}
+.decision p{margin:0;color:var(--ink-soft);font-size:14px}
+
+h3{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-soft);margin:30px 0 12px;
+  padding-bottom:8px;border-bottom:1px solid var(--rule)}
+
+/* handle rows */
+.handle{background:var(--card);border:1px solid var(--rule);border-radius:3px;
+  padding:14px 16px;margin-bottom:8px;display:grid;gap:4px 16px;
+  grid-template-columns:132px 1fr auto;align-items:center;
+  animation:rise .32s ease both}
+@media(max-width:640px){.handle{grid-template-columns:1fr}}
+@keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.handle{animation:none}}
+.plat{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-soft)}
+.hval{font-family:"IBM Plex Mono",monospace;font-size:14.5px;word-break:break-all}
+.hval a{text-decoration:none;border-bottom:1px solid #C3CDDF}
+.conf{font-family:"IBM Plex Mono",monospace;font-size:13px;text-align:right;
+  white-space:nowrap}
+.conf.accept{color:var(--accept)} .conf.review{color:var(--review)}
+
+/* SIGNATURE: the tier ledger — five fixed slots, so you can see at a glance
+   WHY a handle was accepted, not just that it was. */
+.ledger{grid-column:1/-1;display:flex;gap:3px;margin-top:9px;align-items:center}
+.tier{width:44px;height:20px;border:1px solid var(--rule);border-radius:1px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:"IBM Plex Mono",monospace;font-size:10px;color:#B9C2D2;
+  background:#FBFCFD}
+.tier.on{color:#fff;border-color:transparent}
+.tier.t1{background:var(--structured)} .tier.t2{background:#5B7FB8}
+.tier.t3{background:var(--accept)}     .tier.t4{background:#8A94A8}
+.tier.t5{background:var(--reject)}
+.ledger .why{font-size:12px;color:var(--muted);margin-left:10px}
+
+/* candidate cards */
+.cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(258px,1fr))}
+.cardx{background:var(--card);border:1px solid var(--rule);border-radius:3px;
+  padding:16px;box-shadow:var(--shadow)}
+.cardx .qid{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted)}
+.cardx .nm{font-family:Newsreader,serif;font-size:20px;margin:3px 0 6px}
+.cardx .desc{font-size:13.5px;color:var(--ink-soft);min-height:38px}
+.cardx dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;
+  margin:12px 0 0;font-size:12.5px}
+.cardx dt{font-family:"IBM Plex Mono",monospace;font-size:10.5px;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.cardx dd{margin:0}
+.pill{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:10.5px;
+  letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:2px;
+  background:#EDF1F7;color:var(--ink-soft);margin:0 4px 4px 0}
+.pill.win{background:var(--accept);color:#fff}
+
+table{width:100%;border-collapse:collapse;background:var(--card);
+  border:1px solid var(--rule);border-radius:3px;font-size:13.5px}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--rule)}
+th{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-soft);font-weight:400}
+tr:last-child td{border-bottom:0}
+td.k{font-family:"IBM Plex Mono",monospace;color:var(--ink-soft)}
+td.v{font-family:"IBM Plex Mono",monospace;word-break:break-all}
+
+.empty{color:var(--ink-soft);font-size:14px;background:var(--card);
+  border:1px dashed var(--rule);border-radius:3px;padding:18px}
+.err{border-left:3px solid var(--reject);background:#FDF6F5;padding:14px 18px;
+  border-radius:3px;font-size:14px}
+footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
+  font-size:12.5px;color:var(--muted)}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid #fff;
+  border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;
+  vertical-align:-2px;margin-right:8px}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="eyebrow">ListenFirst · Data Operations</div>
+    <h1>Resolve the <em>person</em>,<br>not the name.</h1>
+    <p class="sub">Six people share a name. One is the singer you need. IdentityForge
+      enumerates every human with that name from a structured identity graph, filters
+      by role, then harvests handles from anchors the person declared themselves.</p>
+    <span class="mode {{ 'live' if live else '' }}">{{ 'live mode' if live else 'demo mode — fixtures only' }}</span>
+  </div>
+</header>
+
+<main>
+  <div class="panel">
+    <div class="grid">
+      <div>
+        <label for="name">Name</label>
+        <input id="name" value="Michael Jackson" autocomplete="off"
+               placeholder="e.g. A. R. Rahman">
+      </div>
+      <div>
+        <label for="role">Expected role</label>
+        <select id="role">
+          <option value="">— unknown —</option>
+          {% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="year">Active year</label>
+        <input id="year" inputmode="numeric" placeholder="2005">
+      </div>
+    </div>
+    <div class="row2">
+      <div class="field">
+        <label for="ctx">Context (show, brand, campaign)</label>
+        <input id="ctx" placeholder="Sony Music catalogue" autocomplete="off">
+      </div>
+      <button id="go">Resolve handles</button>
+    </div>
+    <p class="hint">Role comes free from your ingest data — <code>title_category</code>
+      already implies it. Leave it unknown to see what happens on a collision.</p>
+  </div>
+
+  <div id="out"></div>
+
+  <footer>
+    Read-only. Evidence tiers: <span class="mono">T1</span> structured ID ·
+    <span class="mono">T2</span> self-declared · <span class="mono">T3</span> bidirectional ·
+    <span class="mono">T4</span> corroborating · <span class="mono">T5</span> name match.
+    A name match alone never resolves a handle.
+  </footer>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const out = $("#out");
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const TIER_NAME = {1:"structured ID",2:"self-declared",3:"bidirectional",
+                   4:"corroborating",5:"name match"};
+
+function ledger(tiers, sources){
+  const on = new Set(tiers || []);
+  let html = '<div class="ledger">';
+  for (let t=1;t<=5;t++)
+    html += `<span class="tier t${t} ${on.has(t)?"on":""}" title="T${t} ${TIER_NAME[t]}">T${t}</span>`;
+  const why = (sources||[]).slice(0,3).join(" · ");
+  html += `<span class="why">${esc(why)}</span></div>`;
+  return html;
+}
+
+function handleRow(plat, h, verdict){
+  const url = h.url || "";
+  const lang = h.lang ? ` <span class="plat">${esc(h.lang)}</span>` : "";
+  return `<div class="handle">
+    <div class="plat">${esc(plat)}</div>
+    <div class="hval">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener nofollow">${esc(h.handle)}</a>` : esc(h.handle)}${lang}</div>
+    <div class="conf ${verdict}">${(h.confidence ?? 0).toFixed(2)}</div>
+    ${ledger(h.tiers, h.sources)}
+  </div>`;
+}
+
+function render(d){
+  if (d.error){ out.innerHTML = `<section><div class="err"><strong>${esc(d.error)}</strong>${d.detail?"<br>"+esc(d.detail):""}</div></section>`; return; }
+  let html = "";
+
+  if (d.decision === "resolved"){
+    html += `<section><div class="decision">
+      <h2>${esc(d.label)} <span class="qid mono">${esc(d.entity_id)}</span></h2>
+      <p>Resolved on role match${d.margin!=null?` with a margin of ${d.margin}`:""}.
+         Roles: ${esc((d.roles||[]).join(", ")||"—")}.
+         Platform coverage ${Math.round((d.coverage||0)*100)}% of 8.</p>
+    </div></section>`;
+
+    const accepted = d.handles || {};
+    const platKeys = Object.keys(accepted);
+    html += `<section><h3>Accepted handles</h3>`;
+    html += platKeys.length
+      ? platKeys.sort().map(p => accepted[p].map(h => handleRow(p,h,"accept")).join("")).join("")
+      : `<div class="empty">Nothing cleared the 0.75 threshold.</div>`;
+    html += `</section>`;
+
+    if ((d.needs_review||[]).length){
+      html += `<section><h3>Needs one click to confirm</h3>`;
+      html += d.needs_review.map(r => handleRow(r.platform,
+        {handle:r.handle, confidence:r.confidence, tiers:r.tiers, sources:r.sources},
+        "review")).join("");
+      html += `<p class="hint">Single-source and self-declared only. Confirming one
+        of these promotes it to accepted and teaches the store.</p></section>`;
+    }
+
+    const ids = d.external_ids || {};
+    const idk = Object.keys(ids);
+    if (idk.length){
+      html += `<section><h3>Spoke IDs harvested from the hub — ${idk.length} in one call</h3>
+        <table><thead><tr><th>Authority</th><th>Identifier</th></tr></thead><tbody>`;
+      html += idk.sort().map(k => `<tr><td class="k">${esc(k)}</td><td class="v">${esc(ids[k])}</td></tr>`).join("");
+      html += `</tbody></table></section>`;
+    }
+  } else if (d.decision === "disambiguate"){
+    html += `<section><div class="decision disambiguate">
+      <h2>Collision — pick the right person</h2>
+      <p>${esc(d.reason || "Top candidates are too close to separate automatically.")}
+         Refusing to guess is the point: a wrong handle in a deliverable costs more
+         than one click.</p></div></section>`;
+    html += `<section><h3>${(d.cards||[]).length} candidates share this name</h3><div class="cards">`;
+    html += (d.cards||[]).map((c,i) => `<div class="cardx">
+        <div class="qid">${esc(c.entity_id)}</div>
+        <div class="nm">${esc(c.label)}</div>
+        <div class="desc">${esc(c.description||"No description on record.")}</div>
+        <div style="margin-top:10px">${(c.roles||[]).map(r=>`<span class="pill ${i===0&&c.role_score>0?"win":""}">${esc(r)}</span>`).join("")||'<span class="pill">role unknown</span>'}</div>
+        <dl>
+          <dt>Lived</dt><dd>${c.born??"?"}${c.died?" – "+c.died:""}</dd>
+          <dt>IDs</dt><dd>${c.id_count}</dd>
+          <dt>Score</dt><dd class="mono">${c.role_score}</dd>
+          <dt>Source</dt><dd><a href="${esc(c.wikidata)}" target="_blank" rel="noopener">Wikidata</a></dd>
+        </dl></div>`).join("");
+    html += `</div></section>`;
+  } else {
+    html += `<section><div class="decision not_found"><h2>No candidates</h2>
+      <p>No human with that exact label or alias in the identity graph. Label
+         matching is exact and case-sensitive, so try the spelling used on the
+         person's Wikipedia article, or fall back to handle probing.</p>
+    </div></section>`;
+  }
+
+  const fs = d.fetch_stats || {};
+  html += `<section><h3>Run</h3><table><tbody>
+    <tr><td class="k">mode</td><td class="v">${esc(d.mode||"")}</td></tr>` +
+    Object.keys(fs).map(k=>`<tr><td class="k">${esc(k)}</td><td class="v">${esc(fs[k])}</td></tr>`).join("") +
+    `</tbody></table></section>`;
+
+  out.innerHTML = html;
+}
+
+async function run(){
+  const btn = $("#go");
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.innerHTML = '<span class="spin"></span>Resolving';
+  out.innerHTML = "";
+  try{
+    const r = await fetch("/api/resolve", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({name:$("#name").value, role:$("#role").value,
+        active_year:$("#year").value, context:$("#ctx").value})
+    });
+    render(await r.json());
+  }catch(e){
+    out.innerHTML = `<section><div class="err"><strong>Could not reach the resolver.</strong><br>${esc(e.message)}</div></section>`;
+  }finally{
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+$("#go").addEventListener("click", run);
+$("#name").addEventListener("keydown", e => { if(e.key==="Enter") run(); });
+</script>
+</body>
+</html>
