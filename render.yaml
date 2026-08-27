@@ -13,8 +13,23 @@ services:
         value: "0"
       - key: PYTHON_VERSION
         value: "3.12.4"
-      # Set in the dashboard, never in this file.
+      - key: SERPAPI_ENGINE
+        value: "google"
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "12"
+      - key: CACHE_TTL_SECONDS
+        value: "900"
+      # Secrets: sync:false means Render prompts for them and never stores the
+      # value in git. Set every one of these in the dashboard.
       - key: TMDB_API_KEY
+        sync: false
+      - key: TMDB_READ_ACCESS_TOKEN
+        sync: false
+      - key: OMDB_API_KEY
+        sync: false
+      - key: SERPAPI_API_KEY
+        sync: false
+      - key: WIKIMEDIA_CONTACT
         sync: false
       # Render's free tier has an ephemeral filesystem: the SQLite entity store
       # and HTTP cache are wiped on every deploy and on cold start. Fine for

@@ -22,14 +22,28 @@ from flask import Flask, jsonify, render_template, request
 
 from identityforge import authorities
 from identityforge.authorities import OCCUPATION_BUCKETS
+from identityforge.discovery import discover
 from identityforge.fetcher import CachedFetcher, FixtureFetcher, build_fetcher
+from identityforge.providers import omdb_title, search_person
 from identityforge.resolver import EntityStore, Intake, resolve
 
 app = Flask(__name__)
 
 LIVE = os.environ.get("IF_LIVE", "0") == "1"
-TMDB_KEY = os.environ.get("TMDB_API_KEY", "")
 DB_PATH = os.environ.get("IF_DB_PATH", "identityforge.db")
+
+# Credentials come from the environment only. Never hardcode, never log, never
+# return in a response body - /api/config reports presence, not values.
+TMDB_KEY = os.environ.get("TMDB_API_KEY", "")
+TMDB_TOKEN = os.environ.get("TMDB_READ_ACCESS_TOKEN", "")
+OMDB_KEY = os.environ.get("OMDB_API_KEY", "")
+SERPAPI_KEY = os.environ.get("SERPAPI_API_KEY", "")
+SERPAPI_ENGINE = os.environ.get("SERPAPI_ENGINE", "google")
+WIKIMEDIA_CONTACT = os.environ.get("WIKIMEDIA_CONTACT", "")
+
+
+def _present(v: str) -> bool:
+    return bool(v and v.strip())
 
 _store = EntityStore(DB_PATH)
 _live_fetcher: CachedFetcher | None = None
@@ -51,39 +65,53 @@ _LINKTREE = """<html><script id="__NEXT_DATA__" type="application/json">
 ]}}})
 
 DEMO_FIXTURES: dict[str, object] = {
-    "sparql": {"results": {"bindings": [
-        {"p": {"value": "http://www.wikidata.org/entity/Q2831"},
-         "pLabel": {"value": "Michael Jackson"},
-         "pDesc": {"value": "American singer, songwriter and dancer (1958-2009)"},
-         "occ": {"value": "http://www.wikidata.org/entity/Q177220"},
-         "dob": {"value": "1958-08-29T00:00:00Z"},
-         "dod": {"value": "2009-06-25T00:00:00Z"}},
-        {"p": {"value": "http://www.wikidata.org/entity/Q6831397"},
-         "pLabel": {"value": "Michael Jackson"},
-         "pDesc": {"value": "English footballer"},
-         "occ": {"value": "http://www.wikidata.org/entity/Q937857"},
-         "dob": {"value": "1973-01-01T00:00:00Z"}},
-        {"p": {"value": "http://www.wikidata.org/entity/Q1928447"},
-         "pLabel": {"value": "Michael Jackson"},
-         "pDesc": {"value": "British writer on beer and whisky (1942-2007)"},
-         "occ": {"value": "http://www.wikidata.org/entity/Q36180"},
-         "dob": {"value": "1942-03-27T00:00:00Z"},
-         "dod": {"value": "2007-08-30T00:00:00Z"}},
-    ]}},
-    "wbgetentities": {"entities": {"Q2831": {
-        "claims": {
-            "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
-            "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
-            "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
-            "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
-            "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
-            "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
-            "P2397": [{"mainsnak": {"datavalue": {"value": "UCoUM-UJ7rirJYP8CQ0EIaHA"}}}],
-        },
-        "sitelinks": {"enwiki": {"title": "Michael Jackson"},
-                      "hiwiki": {"title": "\u092e\u093e\u0907\u0915\u0932 \u091c\u0948\u0915\u094d\u0938\u0928"},
-                      "jawiki": {"title": "\u30de\u30a4\u30b1\u30eb\u30fb\u30b8\u30e3\u30af\u30bd\u30f3"}},
-    }}},
+    # NOTE: order matters - FixtureFetcher returns the first needle found in
+    # the url, and "wbsearchentities" must be tested before "wbgetentities".
+    "wbsearchentities": {"search": [{"id": "Q2831"}, {"id": "Q6831397"},
+                                    {"id": "Q1928447"}]},
+    "wbgetentities": {"entities": {
+        "Q2831": {
+            "labels": {"en": {"value": "Michael Jackson"}},
+            "aliases": {"en": [{"value": "MJ"}, {"value": "King of Pop"}]},
+            "descriptions": {"en": {"value": "American singer, songwriter and "
+                                             "dancer (1958-2009)"}},
+            "claims": {
+                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
+                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q177220"}}}}],
+                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1958-08-29T00:00:00Z"}}}}],
+                "P570": [{"mainsnak": {"datavalue": {"value": {"time": "+2009-06-25T00:00:00Z"}}}}],
+                "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
+                "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
+                "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
+                "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
+                "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
+                "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
+                "P2397": [{"mainsnak": {"datavalue": {"value": "UCoUM-UJ7rirJYP8CQ0EIaHA"}}}],
+            },
+            "sitelinks": {
+                "enwiki": {"title": "Michael Jackson"},
+                "hiwiki": {"title": "\u092e\u093e\u0907\u0915\u0932 \u091c\u0948\u0915\u094d\u0938\u0928"},
+                "jawiki": {"title": "\u30de\u30a4\u30b1\u30eb\u30fb\u30b8\u30e3\u30af\u30bd\u30f3"},
+            }},
+        "Q6831397": {
+            "labels": {"en": {"value": "Michael Jackson"}},
+            "descriptions": {"en": {"value": "English footballer"}},
+            "claims": {
+                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
+                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q937857"}}}}],
+                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1973-01-01T00:00:00Z"}}}}],
+            }},
+        "Q1928447": {
+            "labels": {"en": {"value": "Michael Jackson"}},
+            "descriptions": {"en": {"value": "British writer on beer and "
+                                             "whisky (1942-2007)"}},
+            "claims": {
+                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
+                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q36180"}}}}],
+                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1942-03-27T00:00:00Z"}}}}],
+                "P570": [{"mainsnak": {"datavalue": {"value": {"time": "+2007-08-30T00:00:00Z"}}}}],
+            }},
+    }},
     "musicbrainz.org/ws": {"relations": [
         {"type": "social network",
          "url": {"resource": "https://www.tiktok.com/@michaeljackson"}},
@@ -117,8 +145,37 @@ def index():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "mode": "live" if LIVE else "demo",
-                    "tmdb_key_present": bool(TMDB_KEY),
-                    "version": "0.2.0"})
+                    "tmdb_key_present": _present(TMDB_KEY),
+                    "version": "0.4.0"})
+
+
+@app.get("/api/config")
+def config():
+    """
+    Which providers are wired up. Reports PRESENCE ONLY - no key material, not
+    even a prefix, since a public endpoint that leaks four characters of a key
+    still narrows a brute force.
+    """
+    return jsonify({
+        "mode": "live" if LIVE else "demo",
+        "providers": {
+            "wikidata":    {"configured": True,
+                            "contact_set": _present(WIKIMEDIA_CONTACT)},
+            "musicbrainz": {"configured": True},
+            "tmdb":        {"configured": _present(TMDB_KEY),
+                            "v4_token": _present(TMDB_TOKEN),
+                            "role": "actors and directors; external_ids in one call"},
+            "omdb":        {"configured": _present(OMDB_KEY),
+                            "role": "TITLE lookups only - no person endpoint, "
+                                    "contributes no handles"},
+            "serpapi":     {"configured": _present(SERPAPI_KEY),
+                            "engine": SERPAPI_ENGINE,
+                            "role": "DISCOVERY only - proposals are Tier 5 and "
+                                    "never auto-accepted"},
+        },
+        "request_timeout_seconds": os.environ.get("REQUEST_TIMEOUT_SECONDS"),
+        "cache_ttl_seconds": os.environ.get("CACHE_TTL_SECONDS"),
+    })
 
 
 @app.get("/api/audit")
@@ -162,7 +219,10 @@ def api_resolve():
     fetch = _fetcher()
     try:
         result = resolve(intake, fetch, _store, tmdb_key=TMDB_KEY,
-                         do_bidirectional=bool(body.get("bidirectional")))
+                         do_bidirectional=bool(body.get("bidirectional")),
+                         serpapi_key=SERPAPI_KEY,
+                         serpapi_engine=SERPAPI_ENGINE,
+                         allow_discovery=bool(body.get("allow_discovery", True)))
     except Exception as exc:                                  # noqa: BLE001
         return jsonify({"error": "Resolution failed.",
                         "detail": str(exc)[:300]}), 502
@@ -192,6 +252,61 @@ def api_classify():
                     "id_kind": ref.id_kind if ref else None,
                     "canonical_url": ref.canonical_url if ref else None})
     return jsonify({"results": out})
+
+
+@app.post("/api/discover")
+def api_discover():
+    """
+    Search-based handle discovery. Everything returned is UNVERIFIED by
+    construction - the response says so explicitly so a caller cannot mistake
+    a proposal for a resolution.
+    """
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Enter a name."}), 400
+    if not LIVE:
+        return jsonify({"error": "Discovery needs live mode.",
+                        "detail": "Set IF_LIVE=1 to enable outbound search."}), 409
+    if not _present(SERPAPI_KEY):
+        return jsonify({"error": "SERPAPI_API_KEY is not configured."}), 503
+
+    res = discover(name, _fetcher(), SERPAPI_KEY,
+                   role=(body.get("role") or "").strip(),
+                   engine=SERPAPI_ENGINE)
+    return jsonify({"name": name, "verified": False,
+                    "warning": "Search proposals only. Confirm before use.",
+                    "proposals": [p.as_dict() for p in res.proposals],
+                    "by_platform": res.by_platform(),
+                    "aggregator_urls": res.aggregator_urls,
+                    "queries_run": res.queries_run,
+                    "errors": res.errors})
+
+
+@app.post("/api/tmdb-search")
+def api_tmdb_search():
+    """TMDB person search that refuses to guess on a collision."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Enter a name."}), 400
+    if not _present(TMDB_KEY):
+        return jsonify({"error": "TMDB_API_KEY is not configured."}), 503
+    return jsonify(search_person(name, _fetcher(), TMDB_KEY,
+                                 (body.get("role") or "").strip() or None))
+
+
+@app.post("/api/omdb-title")
+def api_omdb_title():
+    """Title context for disambiguation cards. Contributes no handles."""
+    body = request.get_json(silent=True) or {}
+    q = (body.get("title") or body.get("imdb_id") or "").strip()
+    if not q:
+        return jsonify({"error": "Provide a title or imdb_id."}), 400
+    if not _present(OMDB_KEY):
+        return jsonify({"error": "OMDB_API_KEY is not configured."}), 503
+    return jsonify(omdb_title(q, _fetcher(), OMDB_KEY) or
+                   {"error": "Not found in OMDb."})
 
 
 if __name__ == "__main__":

@@ -26,6 +26,11 @@ node the person themselves attached their accounts to. Two consequences:
 | `aggregators.py` | 22 link-in-bio domains, `__NEXT_DATA__` / `__NUXT__` / JSON-LD / anchor extractors, forward handle probing, reverse cascade, generic aggregator heuristic. |
 | `evidence.py` | 5-tier evidence model, diminishing-returns confidence, role-match scoring, `resolved` / `disambiguate` / `not_found` routing. |
 | `resolver.py` | Pipeline orchestration + SQLite entity store, collision registry and resolution log. |
+| `wikidata.py` | Candidate lookup: `wbsearchentities` for recall across name variants and languages, then batched `wbgetentities` to keep humans only and pull occupation/dates. |
+| `labels.py` | Name normalisation, variant generation, script detection, fuzzy label scoring. |
+| `providers.py` | TMDB person search that refuses to guess on a collision; OMDb title context. |
+| `discovery.py` | SerpAPI handle discovery. Proposals are Tier 5 — search can never auto-accept. |
+| `fetcher.py` | Cached, rate-limited, allowlisted HTTP with query-string secret redaction. |
 
 ## Evidence tiers
 
@@ -109,10 +114,39 @@ else:
     result["external_ids"]   # spotify/musicbrainz/tmdb/... for free
 ```
 
+## Name matching
+
+The first version matched labels exactly:
+
+```
+?p rdfs:label|skos:altLabel "A. R. Rahman"@en
+```
+
+Case-, punctuation- and diacritic-sensitive, so `A.R. Rahman`, `AR Rahman` and
+every non-Latin spelling returned nothing while the person sat in the graph.
+Silent false negatives are worse than collisions: the operator reads
+`not_found` as "no Wikidata item" and goes back to manual work.
+
+Now: `wbsearchentities` across generated name variants in the name's own
+script plus English (recall), then batched `wbgetentities` to drop non-humans
+and score the label match (precision). Every candidate carries
+`label_match: {score, how, matched}` where `how` is one of exact, normalized,
+initials, token, fuzzy, translit — a `translit` match deserves more scrutiny
+than an `exact` one, so the UI can say which it was.
+
+**Transliteration is deliberately not the matching mechanism.** Unidecode
+renders `शाहरुख़ ख़ान` as `shaahrukh' kh'aan` and Tamil `ஏ. ஆர். ரகுமான்` as
+`ee. aar. rkumaannn` — fine for telling names apart, useless for matching them.
+Cross-script matching is delegated to Wikidata, which already stores each
+person's name in every script they're known in. Cross-script scores are capped
+at 0.75 so they can never alone carry a decision.
+
 ## Verification status
 
-68/68 offline tests pass, including the full Michael Jackson collision
-(singer / footballer / beer writer) end to end against fixtures.
+161 offline tests pass across three suites (`test_all`, `test_providers`,
+`test_labels`), including the full Michael Jackson collision (singer /
+footballer / beer writer) end to end, the guarantee that search-only evidence
+can never auto-accept, and a check that no API key reaches the cache table.
 
 **Not yet verified against live endpoints** — this container can only reach
 PyPI/GitHub, so no request has actually hit Wikidata, Linktree, TMDB or

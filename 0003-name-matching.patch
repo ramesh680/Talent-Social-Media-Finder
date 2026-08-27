@@ -1,0 +1,1018 @@
+From e2d219540efbce0ab50d022640d7a0280e2ad0cd Mon Sep 17 00:00:00 2001
+From: Ramesh Goswami <ramesh@listenfirstmedia.com>
+Date: Thu, 27 Aug 2026 15:29:06 +0000
+Subject: [PATCH] v0.4.0: replace exact-label SPARQL with variant-aware
+ multilingual lookup
+
+The exact-match query produced silent false negatives - 'A.R. Rahman' vs
+'A. R. Rahman', and every non-Latin spelling - which is worse than a collision
+because not_found reads as 'no Wikidata item'.
+
+- labels.py: normalisation (initials, diacritics, honorifics, suffixes),
+  variant generation, script detection -> search languages, fuzzy scoring with
+  provenance (exact|normalized|initials|token|fuzzy|translit).
+- wikidata.py: wbsearchentities for recall across variants and languages, then
+  batched wbgetentities for precision - P31=Q5 humans only, label floor 0.62.
+  Drops films and disambiguation pages that share a person's name.
+- Transliteration is a weak signal only, capped at 0.75. Unidecode is far too
+  lossy on Indic scripts to carry a matching decision; Wikidata's own
+  multilingual labels do that work instead.
+- Candidate.label_match records how the name matched, so a translit hit can be
+  scrutinised differently from an exact one.
+- Old exact-SPARQL path kept as discover_candidates_sparql for reference.
+
+161/161 tests pass across three suites. No credentials in any file.
+---
+ README.md                 |  38 +++++-
+ app.py                    |  82 +++++++-----
+ identityforge/__init__.py |   4 +-
+ identityforge/evidence.py |   4 +
+ identityforge/labels.py   | 259 ++++++++++++++++++++++++++++++++++++++
+ identityforge/resolver.py |  18 +++
+ identityforge/wikidata.py | 182 +++++++++++++++++++++++++++
+ requirements.txt          |   1 +
+ tests/test_all.py         |  76 ++++++-----
+ tests/test_labels.py      | 175 ++++++++++++++++++++++++++
+ 10 files changed, 773 insertions(+), 66 deletions(-)
+ create mode 100644 identityforge/labels.py
+ create mode 100644 identityforge/wikidata.py
+ create mode 100644 tests/test_labels.py
+
+diff --git a/README.md b/README.md
+index 8fdb6ed..b8b12a2 100644
+--- a/README.md
++++ b/README.md
+@@ -26,6 +26,11 @@ node the person themselves attached their accounts to. Two consequences:
+ | `aggregators.py` | 22 link-in-bio domains, `__NEXT_DATA__` / `__NUXT__` / JSON-LD / anchor extractors, forward handle probing, reverse cascade, generic aggregator heuristic. |
+ | `evidence.py` | 5-tier evidence model, diminishing-returns confidence, role-match scoring, `resolved` / `disambiguate` / `not_found` routing. |
+ | `resolver.py` | Pipeline orchestration + SQLite entity store, collision registry and resolution log. |
++| `wikidata.py` | Candidate lookup: `wbsearchentities` for recall across name variants and languages, then batched `wbgetentities` to keep humans only and pull occupation/dates. |
++| `labels.py` | Name normalisation, variant generation, script detection, fuzzy label scoring. |
++| `providers.py` | TMDB person search that refuses to guess on a collision; OMDb title context. |
++| `discovery.py` | SerpAPI handle discovery. Proposals are Tier 5 — search can never auto-accept. |
++| `fetcher.py` | Cached, rate-limited, allowlisted HTTP with query-string secret redaction. |
+ 
+ ## Evidence tiers
+ 
+@@ -109,10 +114,39 @@ else:
+     result["external_ids"]   # spotify/musicbrainz/tmdb/... for free
+ ```
+ 
++## Name matching
++
++The first version matched labels exactly:
++
++```
++?p rdfs:label|skos:altLabel "A. R. Rahman"@en
++```
++
++Case-, punctuation- and diacritic-sensitive, so `A.R. Rahman`, `AR Rahman` and
++every non-Latin spelling returned nothing while the person sat in the graph.
++Silent false negatives are worse than collisions: the operator reads
++`not_found` as "no Wikidata item" and goes back to manual work.
++
++Now: `wbsearchentities` across generated name variants in the name's own
++script plus English (recall), then batched `wbgetentities` to drop non-humans
++and score the label match (precision). Every candidate carries
++`label_match: {score, how, matched}` where `how` is one of exact, normalized,
++initials, token, fuzzy, translit — a `translit` match deserves more scrutiny
++than an `exact` one, so the UI can say which it was.
++
++**Transliteration is deliberately not the matching mechanism.** Unidecode
++renders `शाहरुख़ ख़ान` as `shaahrukh' kh'aan` and Tamil `ஏ. ஆர். ரகுமான்` as
++`ee. aar. rkumaannn` — fine for telling names apart, useless for matching them.
++Cross-script matching is delegated to Wikidata, which already stores each
++person's name in every script they're known in. Cross-script scores are capped
++at 0.75 so they can never alone carry a decision.
++
+ ## Verification status
+ 
+-68/68 offline tests pass, including the full Michael Jackson collision
+-(singer / footballer / beer writer) end to end against fixtures.
++161 offline tests pass across three suites (`test_all`, `test_providers`,
++`test_labels`), including the full Michael Jackson collision (singer /
++footballer / beer writer) end to end, the guarantee that search-only evidence
++can never auto-accept, and a check that no API key reaches the cache table.
+ 
+ **Not yet verified against live endpoints** — this container can only reach
+ PyPI/GitHub, so no request has actually hit Wikidata, Linktree, TMDB or
+diff --git a/app.py b/app.py
+index eed0297..6a337d0 100644
+--- a/app.py
++++ b/app.py
+@@ -65,39 +65,53 @@ _LINKTREE = """<html><script id="__NEXT_DATA__" type="application/json">
+ ]}}})
+ 
+ DEMO_FIXTURES: dict[str, object] = {
+-    "sparql": {"results": {"bindings": [
+-        {"p": {"value": "http://www.wikidata.org/entity/Q2831"},
+-         "pLabel": {"value": "Michael Jackson"},
+-         "pDesc": {"value": "American singer, songwriter and dancer (1958-2009)"},
+-         "occ": {"value": "http://www.wikidata.org/entity/Q177220"},
+-         "dob": {"value": "1958-08-29T00:00:00Z"},
+-         "dod": {"value": "2009-06-25T00:00:00Z"}},
+-        {"p": {"value": "http://www.wikidata.org/entity/Q6831397"},
+-         "pLabel": {"value": "Michael Jackson"},
+-         "pDesc": {"value": "English footballer"},
+-         "occ": {"value": "http://www.wikidata.org/entity/Q937857"},
+-         "dob": {"value": "1973-01-01T00:00:00Z"}},
+-        {"p": {"value": "http://www.wikidata.org/entity/Q1928447"},
+-         "pLabel": {"value": "Michael Jackson"},
+-         "pDesc": {"value": "British writer on beer and whisky (1942-2007)"},
+-         "occ": {"value": "http://www.wikidata.org/entity/Q36180"},
+-         "dob": {"value": "1942-03-27T00:00:00Z"},
+-         "dod": {"value": "2007-08-30T00:00:00Z"}},
+-    ]}},
+-    "wbgetentities": {"entities": {"Q2831": {
+-        "claims": {
+-            "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
+-            "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
+-            "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
+-            "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
+-            "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
+-            "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
+-            "P2397": [{"mainsnak": {"datavalue": {"value": "UCoUM-UJ7rirJYP8CQ0EIaHA"}}}],
+-        },
+-        "sitelinks": {"enwiki": {"title": "Michael Jackson"},
+-                      "hiwiki": {"title": "\u092e\u093e\u0907\u0915\u0932 \u091c\u0948\u0915\u094d\u0938\u0928"},
+-                      "jawiki": {"title": "\u30de\u30a4\u30b1\u30eb\u30fb\u30b8\u30e3\u30af\u30bd\u30f3"}},
+-    }}},
++    # NOTE: order matters - FixtureFetcher returns the first needle found in
++    # the url, and "wbsearchentities" must be tested before "wbgetentities".
++    "wbsearchentities": {"search": [{"id": "Q2831"}, {"id": "Q6831397"},
++                                    {"id": "Q1928447"}]},
++    "wbgetentities": {"entities": {
++        "Q2831": {
++            "labels": {"en": {"value": "Michael Jackson"}},
++            "aliases": {"en": [{"value": "MJ"}, {"value": "King of Pop"}]},
++            "descriptions": {"en": {"value": "American singer, songwriter and "
++                                             "dancer (1958-2009)"}},
++            "claims": {
++                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q177220"}}}}],
++                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1958-08-29T00:00:00Z"}}}}],
++                "P570": [{"mainsnak": {"datavalue": {"value": {"time": "+2009-06-25T00:00:00Z"}}}}],
++                "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++                "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++                "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
++                "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
++                "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
++                "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
++                "P2397": [{"mainsnak": {"datavalue": {"value": "UCoUM-UJ7rirJYP8CQ0EIaHA"}}}],
++            },
++            "sitelinks": {
++                "enwiki": {"title": "Michael Jackson"},
++                "hiwiki": {"title": "\u092e\u093e\u0907\u0915\u0932 \u091c\u0948\u0915\u094d\u0938\u0928"},
++                "jawiki": {"title": "\u30de\u30a4\u30b1\u30eb\u30fb\u30b8\u30e3\u30af\u30bd\u30f3"},
++            }},
++        "Q6831397": {
++            "labels": {"en": {"value": "Michael Jackson"}},
++            "descriptions": {"en": {"value": "English footballer"}},
++            "claims": {
++                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q937857"}}}}],
++                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1973-01-01T00:00:00Z"}}}}],
++            }},
++        "Q1928447": {
++            "labels": {"en": {"value": "Michael Jackson"}},
++            "descriptions": {"en": {"value": "British writer on beer and "
++                                             "whisky (1942-2007)"}},
++            "claims": {
++                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q36180"}}}}],
++                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1942-03-27T00:00:00Z"}}}}],
++                "P570": [{"mainsnak": {"datavalue": {"value": {"time": "+2007-08-30T00:00:00Z"}}}}],
++            }},
++    }},
+     "musicbrainz.org/ws": {"relations": [
+         {"type": "social network",
+          "url": {"resource": "https://www.tiktok.com/@michaeljackson"}},
+@@ -132,7 +146,7 @@ def index():
+ def health():
+     return jsonify({"ok": True, "mode": "live" if LIVE else "demo",
+                     "tmdb_key_present": _present(TMDB_KEY),
+-                    "version": "0.3.0"})
++                    "version": "0.4.0"})
+ 
+ 
+ @app.get("/api/config")
+diff --git a/identityforge/__init__.py b/identityforge/__init__.py
+index 044022c..8b36980 100644
+--- a/identityforge/__init__.py
++++ b/identityforge/__init__.py
+@@ -5,7 +5,9 @@ from .evidence import Tier, Evidence, HandleClaim, Candidate, rank, score_role_m
+ from .resolver import Intake, EntityStore, resolve
+ from .discovery import discover, DiscoveryResult, Proposal
+ from .providers import search_person, enrich_from_tmdb, omdb_title
++from .labels import normalize, variants, match_label, script_of, search_languages
++from .wikidata import find_candidates
+ from .fetcher import CachedFetcher, FixtureFetcher, build_fetcher, redact
+ from . import authorities
+ 
+-__version__ = "0.3.0"
++__version__ = "0.4.0"
+diff --git a/identityforge/evidence.py b/identityforge/evidence.py
+index 2c2ebcc..07e8232 100644
+--- a/identityforge/evidence.py
++++ b/identityforge/evidence.py
+@@ -127,6 +127,10 @@ class Candidate:
+     claims: dict[str, HandleClaim] = field(default_factory=dict)
+     role_score: float = 0.0
+     thumbnail: str = ""
++    label_match: dict = field(default_factory=dict)
++    """How the queried name matched this entity: {score, how, matched}.
++    'how' is exact | normalized | initials | token | fuzzy | translit — worth
++    surfacing, because a 'translit' match deserves more scrutiny than 'exact'."""
+ 
+     def add_claim(self, ref: PlatformRef, ev: Evidence) -> None:
+         k = ref.key()
+diff --git a/identityforge/labels.py b/identityforge/labels.py
+new file mode 100644
+index 0000000..f1a47f4
+--- /dev/null
++++ b/identityforge/labels.py
+@@ -0,0 +1,259 @@
++"""
++Name normalisation and variant generation.
++
++THE PROBLEM THIS FIXES
++----------------------
++The original candidate query matched labels exactly:
++
++    ?p rdfs:label|skos:altLabel "A. R. Rahman"@en
++
++That is case-sensitive, punctuation-sensitive and diacritic-sensitive, so
++"A.R. Rahman", "AR Rahman", "a. r. rahman" and "Allah Rakha Rahman" all return
++nothing while the person sits right there in the graph. Silent false negatives
++are worse than collisions here, because the operator reads "not_found" as "this
++person has no Wikidata item" and goes back to manual work.
++
++WHAT I TRIED AND REJECTED
++-------------------------
++Transliterating non-Latin names to Latin and comparing strings. Unidecode turns
++"शाहरुख़ ख़ान" into "shaahrukh' kh'aan" (not "Shah Rukh Khan") and the Tamil
++"ஏ. ஆர். ரகுமான்" into "ee. aar. rkumaannn" (not "A. R. Rahman"). Good enough to
++tell two names apart, nowhere near good enough to match them.
++
++So transliteration is used only as a weak scoring signal, never as the matching
++mechanism. The actual cross-script matching is delegated to Wikidata, which
++already stores each person's name in Devanagari, Tamil, Japanese and the rest as
++labels and aliases on the same Q-item. Searching its multilingual index beats
++anything we can do to the string locally.
++"""
++
++from __future__ import annotations
++
++import re
++import unicodedata
++from dataclasses import dataclass
++from difflib import SequenceMatcher
++from typing import Iterable, Optional
++
++try:                                    # optional; degrades gracefully
++    from unidecode import unidecode as _unidecode
++except ImportError:                     # pragma: no cover
++    def _unidecode(s: str) -> str:
++        return s
++
++# Titles and suffixes that carry no identity information.
++_HONORIFICS = {
++    "mr", "mrs", "ms", "miss", "dr", "prof", "professor", "sir", "dame",
++    "lord", "lady", "rev", "reverend", "hon", "capt", "sgt", "shri", "smt",
++    "sri", "pandit", "ustad", "maestro",
++}
++_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "phd", "md", "esq", "obe", "mbe", "cbe"}
++
++_SCRIPT_RANGES = [
++    ("devanagari", 0x0900, 0x097F),
++    ("bengali", 0x0980, 0x09FF),
++    ("gurmukhi", 0x0A00, 0x0A7F),
++    ("gujarati", 0x0A80, 0x0AFF),
++    ("tamil", 0x0B80, 0x0BFF),
++    ("telugu", 0x0C00, 0x0C7F),
++    ("kannada", 0x0C80, 0x0CFF),
++    ("malayalam", 0x0D00, 0x0D7F),
++    ("arabic", 0x0600, 0x06FF),
++    ("hebrew", 0x0590, 0x05FF),
++    ("cyrillic", 0x0400, 0x04FF),
++    ("greek", 0x0370, 0x03FF),
++    ("hangul", 0xAC00, 0xD7AF),
++    ("hiragana", 0x3040, 0x309F),
++    ("katakana", 0x30A0, 0x30FF),
++    ("cjk", 0x4E00, 0x9FFF),
++    ("thai", 0x0E00, 0x0E7F),
++]
++
++# script -> Wikidata language codes worth searching in. Searching the graph in
++# the name's own script is what actually solves cross-script matching.
++SCRIPT_LANGS: dict[str, tuple[str, ...]] = {
++    "devanagari": ("hi", "mr", "ne", "sa"),
++    "bengali": ("bn",),
++    "gurmukhi": ("pa",),
++    "gujarati": ("gu",),
++    "tamil": ("ta",),
++    "telugu": ("te",),
++    "kannada": ("kn",),
++    "malayalam": ("ml",),
++    "arabic": ("ar", "fa", "ur"),
++    "hebrew": ("he",),
++    "cyrillic": ("ru", "uk", "bg", "sr"),
++    "greek": ("el",),
++    "hangul": ("ko",),
++    "hiragana": ("ja",),
++    "katakana": ("ja",),
++    "cjk": ("zh", "ja"),
++    "thai": ("th",),
++    "latin": ("en",),
++}
++
++
++def script_of(text: str) -> str:
++    """Dominant non-Latin script in `text`, or 'latin'."""
++    counts: dict[str, int] = {}
++    for ch in text or "":
++        cp = ord(ch)
++        if ch.isspace() or not ch.isalpha():
++            continue
++        for name, lo, hi in _SCRIPT_RANGES:
++            if lo <= cp <= hi:
++                counts[name] = counts.get(name, 0) + 1
++                break
++        else:
++            counts["latin"] = counts.get("latin", 0) + 1
++    if not counts:
++        return "latin"
++    return max(counts.items(), key=lambda kv: kv[1])[0]
++
++
++def search_languages(name: str) -> list[str]:
++    """Which Wikidata language indexes to search for this name."""
++    sc = script_of(name)
++    langs = list(SCRIPT_LANGS.get(sc, ("en",)))
++    if "en" not in langs:
++        langs.append("en")          # most items carry an English label too
++    return langs
++
++
++def strip_marks(text: str) -> str:
++    """Beyoncé -> Beyonce. NFKD then drop combining marks."""
++    decomposed = unicodedata.normalize("NFKD", text or "")
++    return "".join(c for c in decomposed if not unicodedata.combining(c))
++
++
++def normalize(name: str, drop_honorifics: bool = True) -> str:
++    """
++    Aggressive comparison form. Not for display.
++
++    'Dr. A.R. Rahman Jr.' -> 'a r rahman'
++    """
++    s = strip_marks(name or "").lower()
++    s = s.replace("&", " and ")
++    # split initials glued to letters: "a.r." -> "a r "
++    s = re.sub(r"([a-z])\.", r"\1 ", s)
++    s = re.sub(r"[^\w\s]+", " ", s, flags=re.UNICODE)
++    tokens = [t for t in s.split() if t]
++    if drop_honorifics:
++        while tokens and tokens[0] in _HONORIFICS:
++            tokens.pop(0)
++        while tokens and tokens[-1] in _SUFFIXES:
++            tokens.pop()
++    return " ".join(tokens)
++
++
++def initials_form(name: str) -> str:
++    """'Allah Rakha Rahman' -> 'a r rahman' (initialise all but the last token)."""
++    toks = normalize(name).split()
++    if len(toks) < 2:
++        return " ".join(toks)
++    return " ".join([t[0] for t in toks[:-1]] + [toks[-1]])
++
++
++def variants(name: str, max_variants: int = 10) -> list[str]:
++    """
++    Query strings to try, most faithful first.
++
++    Kept small on purpose: each variant is a network call, and Wikidata's own
++    search already absorbs most spelling slack.
++    """
++    out: list[str] = []
++
++    def add(v: str) -> None:
++        v = (v or "").strip()
++        if v and v.lower() not in {o.lower() for o in out}:
++            out.append(v)
++
++    add(name)
++    add(strip_marks(name))                        # diacritics dropped
++    n = normalize(name)
++    add(n)
++
++    toks = n.split()
++    if len(toks) >= 2:
++        add(initials_form(name))                  # A R Rahman
++        add(" ".join(toks[:1] + toks[-1:]))       # drop middle names
++        # single-letter tokens collapsed: 'a r rahman' -> 'ar rahman'
++        lead = "".join(t for t in toks[:-1] if len(t) == 1)
++        if lead and len(lead) > 1:
++            add(f"{lead} {toks[-1]}")
++        # 'Last, First' -> 'First Last'
++        if "," in name:
++            parts = [p.strip() for p in name.split(",", 1)]
++            if len(parts) == 2 and all(parts):
++                add(f"{parts[1]} {parts[0]}")
++
++    if script_of(name) != "latin":
++        t = _unidecode(name)
++        # only offer transliteration if it produced something plausible; it is
++        # a weak signal and a mangled string wastes a query
++        if t and t != name and re.search(r"[a-zA-Z]{3}", t):
++            add(normalize(t))
++
++    return out[:max_variants]
++
++
++# ---------------------------------------------------------------------------
++# scoring
++# ---------------------------------------------------------------------------
++
++@dataclass
++class LabelMatch:
++    score: float
++    matched_label: str
++    how: str            # exact | normalized | initials | token | fuzzy | translit
++
++
++def _token_overlap(a: str, b: str) -> float:
++    ta, tb = set(a.split()), set(b.split())
++    if not ta or not tb:
++        return 0.0
++    return len(ta & tb) / len(ta | tb)
++
++
++def match_label(query: str, label: str) -> LabelMatch:
++    """How well does one candidate label match the queried name?"""
++    if not query or not label:
++        return LabelMatch(0.0, label, "none")
++    if query.strip() == label.strip():
++        return LabelMatch(1.0, label, "exact")
++
++    nq, nl = normalize(query), normalize(label)
++    if nq and nq == nl:
++        return LabelMatch(0.97, label, "normalized")
++    if nq and initials_form(query) == initials_form(label):
++        return LabelMatch(0.90, label, "initials")
++
++    overlap = _token_overlap(nq, nl)
++    if overlap == 1.0:
++        return LabelMatch(0.88, label, "token")
++
++    ratio = SequenceMatcher(None, nq, nl).ratio()
++    if script_of(query) != script_of(label):
++        # cross-script: compare transliterations, but cap the score because
++        # Indic transliteration is too lossy to trust for a decision
++        tq, tl = normalize(_unidecode(query)), normalize(_unidecode(label))
++        tratio = SequenceMatcher(None, tq, tl).ratio()
++        if tratio > ratio:
++            return LabelMatch(round(min(tratio, 0.75), 3), label, "translit")
++
++    blended = 0.6 * ratio + 0.4 * overlap
++    return LabelMatch(round(blended, 3), label, "fuzzy")
++
++
++def best_label_match(query: str, labels: Iterable[str]) -> LabelMatch:
++    best = LabelMatch(0.0, "", "none")
++    for lab in labels:
++        m = match_label(query, lab)
++        if m.score > best.score:
++            best = m
++    return best
++
++
++# Below this, a candidate is not the same name at all and should be dropped
++# before role scoring ever sees it.
++LABEL_FLOOR = 0.62
+diff --git a/identityforge/resolver.py b/identityforge/resolver.py
+index 3e1a972..28979a4 100644
+--- a/identityforge/resolver.py
++++ b/identityforge/resolver.py
+@@ -37,6 +37,7 @@ from .aggregators import (harvest, is_aggregator_url, looks_like_aggregator,
+                           probe_urls, extract_links, extract_sameas)
+ from .discovery import attach_as_unverified, discover
+ from .providers import enrich_from_tmdb
++from .wikidata import find_candidates
+ from .evidence import (Candidate, Evidence, HandleClaim, Tier, rank,
+                        score_role_match)
+ from .platforms import (Platform, PlatformRef, TARGET_PLATFORMS, build_url,
+@@ -84,6 +85,23 @@ def _qid(uri: str) -> str:
+ 
+ 
+ def discover_candidates(intake: Intake, fetch: Fetch) -> list[Candidate]:
++    """
++    Wikidata candidate enumeration.
++
++    Delegates to wikidata.find_candidates, which searches Wikidata's own
++    multilingual index across name variants rather than matching labels
++    exactly. The old exact-SPARQL version is kept below as
++    discover_candidates_sparql for reference; it produced silent false
++    negatives on "A.R. Rahman" vs "A. R. Rahman" and on every non-Latin script.
++    """
++    res = find_candidates(intake.name, fetch,
++                          expected_role=intake.expected_role,
++                          country=intake.country,
++                          active_year=intake.active_year)
++    return res["candidates"]
++
++
++def discover_candidates_sparql(intake: Intake, fetch: Fetch) -> list[Candidate]:
+     """
+     One SPARQL call returns EVERY human with this name/alias, each already a
+     distinct entity. This is the step that structurally eliminates your
+diff --git a/identityforge/wikidata.py b/identityforge/wikidata.py
+new file mode 100644
+index 0000000..88aeb13
+--- /dev/null
++++ b/identityforge/wikidata.py
+@@ -0,0 +1,182 @@
++"""
++Candidate lookup against Wikidata.
++
++Replaces the exact-label SPARQL query. Two stages:
++
++  RECALL     wbsearchentities across name variants and languages. This is
++             Wikidata's own search index: alias-aware, diacritic-tolerant, and
++             it already holds each person's name in every script they are known
++             in, which is what makes cross-script matching work without us
++             doing any transliteration.
++
++  PRECISION  batch wbgetentities on the hits to keep only humans (P31=Q5) and
++             pull occupation / dates / citizenship, then score the label match
++             and drop anything that is not really the same name.
++
++Why not SPARQL for recall: there is no cheap way to normalise labels
++server-side, and `CONTAINS`/`REGEX` over all labels is a timeout. Why not
++SPARQL only for precision: wbgetentities takes 50 ids per call, so one request
++covers a whole candidate set.
++"""
++
++from __future__ import annotations
++
++from typing import Callable, Optional
++from urllib.parse import urlencode
++
++from .authorities import role_for_occupation
++from .evidence import Candidate, score_role_match
++from .labels import (LABEL_FLOOR, best_label_match, normalize,
++                     search_languages, variants)
++
++WD_API = "https://www.wikidata.org/w/api.php"
++Q_HUMAN = "Q5"
++
++
++def _search_url(term: str, lang: str, limit: int = 15) -> str:
++    return WD_API + "?" + urlencode({
++        "action": "wbsearchentities", "search": term, "language": lang,
++        "uselang": lang, "type": "item", "limit": limit, "format": "json",
++    })
++
++
++def _entities_url(ids: list[str]) -> str:
++    return WD_API + "?" + urlencode({
++        "action": "wbgetentities", "ids": "|".join(ids),
++        "props": "labels|aliases|claims|descriptions|sitelinks",
++        "format": "json",
++    })
++
++
++def _first_id(claims: dict, prop: str) -> Optional[str]:
++    for st in claims.get(prop, []):
++        val = ((st.get("mainsnak") or {}).get("datavalue") or {}).get("value")
++        if isinstance(val, dict) and "id" in val:
++            return val["id"]
++    return None
++
++
++def _all_ids(claims: dict, prop: str) -> list[str]:
++    out = []
++    for st in claims.get(prop, []):
++        val = ((st.get("mainsnak") or {}).get("datavalue") or {}).get("value")
++        if isinstance(val, dict) and val.get("id"):
++            out.append(val["id"])
++    return out
++
++
++def _time_year(claims: dict, prop: str) -> Optional[int]:
++    for st in claims.get(prop, []):
++        val = ((st.get("mainsnak") or {}).get("datavalue") or {}).get("value")
++        if isinstance(val, dict) and val.get("time"):
++            t = val["time"]                      # e.g. '+1958-08-29T00:00:00Z'
++            sign = -1 if t.startswith("-") else 1
++            digits = t.lstrip("+-").split("-", 1)[0]
++            if digits.isdigit():
++                return sign * int(digits)
++    return None
++
++
++def _labels_and_aliases(ent: dict) -> list[str]:
++    out: list[str] = []
++    for v in (ent.get("labels") or {}).values():
++        if v.get("value"):
++            out.append(v["value"])
++    for arr in (ent.get("aliases") or {}).values():
++        for v in arr:
++            if v.get("value"):
++                out.append(v["value"])
++    return out
++
++
++def find_candidates(name: str, fetch: Callable, expected_role: Optional[str] = None,
++                    country: Optional[str] = None,
++                    active_year: Optional[int] = None,
++                    max_queries: int = 6,
++                    label_floor: float = LABEL_FLOOR) -> dict:
++    """
++    Return {"candidates": [...], "queries_run": n, "dropped": [...],
++            "hit_ids": n} — every candidate a real human whose name plausibly
++    matches, with label-match provenance attached.
++    """
++    if not (name or "").strip():
++        return {"candidates": [], "queries_run": 0, "dropped": [], "hit_ids": 0}
++
++    langs = search_languages(name)
++    terms = variants(name)
++
++    # Budget queries: the faithful variants in the name's own language first,
++    # then English, then the looser variants. Most names resolve on query one.
++    plan: list[tuple[str, str]] = []
++    for lang in langs[:2]:
++        for term in terms[:3]:
++            plan.append((term, lang))
++    for term in terms[3:]:
++        plan.append((term, langs[0]))
++
++    seen_ids: list[str] = []
++    queries = 0
++    for term, lang in plan:
++        if queries >= max_queries:
++            break
++        data = fetch(_search_url(term, lang), kind="json") or {}
++        queries += 1
++        for row in (data.get("search") or []):
++            qid = row.get("id")
++            if qid and qid not in seen_ids:
++                seen_ids.append(qid)
++        # early exit: a strong exact hit in the first query is the common case
++        if queries == 1 and len(seen_ids) == 1:
++            break
++
++    if not seen_ids:
++        return {"candidates": [], "queries_run": queries, "dropped": [],
++                "hit_ids": 0}
++
++    candidates: list[Candidate] = []
++    dropped: list[dict] = []
++    for i in range(0, len(seen_ids[:100]), 50):
++        chunk = seen_ids[i:i + 50]
++        data = fetch(_entities_url(chunk), kind="json") or {}
++        queries += 1
++        for qid, ent in ((data.get("entities") or {}).items()):
++            if not isinstance(ent, dict) or ent.get("missing") is not None:
++                continue
++            claims = ent.get("claims") or {}
++
++            # humans only. A film, an album or a disambiguation page can share
++            # a person's name and must never reach the candidate list.
++            if Q_HUMAN not in _all_ids(claims, "P31"):
++                dropped.append({"entity_id": qid, "why": "not a human (P31)"})
++                continue
++
++            labels = _labels_and_aliases(ent)
++            lm = best_label_match(name, labels)
++            if lm.score < label_floor:
++                dropped.append({"entity_id": qid, "why": "label mismatch",
++                                "score": lm.score, "closest": lm.matched_label})
++                continue
++
++            occ = _all_ids(claims, "P106")
++            cand = Candidate(
++                entity_id=qid,
++                label=((ent.get("labels") or {}).get("en") or
++                       next(iter((ent.get("labels") or {}).values()), {})
++                       ).get("value", ""),
++                description=((ent.get("descriptions") or {}).get("en") or {}
++                             ).get("value", ""),
++                occupations=occ,
++                roles=sorted({r for o in occ if (r := role_for_occupation(o))}),
++                birth_year=_time_year(claims, "P569"),
++                death_year=_time_year(claims, "P570"),
++                citizenship=_all_ids(claims, "P27"),
++            )
++            cand.label_match = {"score": lm.score, "how": lm.how,
++                                "matched": lm.matched_label}
++            score_role_match(cand, expected_role, country, active_year)
++            # a weaker name match should not outrank a strong one on role alone
++            cand.role_score = round(cand.role_score + (lm.score - 1.0) * 0.5, 3)
++            candidates.append(cand)
++
++    return {"candidates": candidates, "queries_run": queries,
++            "dropped": dropped, "hit_ids": len(seen_ids)}
+diff --git a/requirements.txt b/requirements.txt
+index bdb61ec..c428732 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,2 +1,3 @@
+ Flask==3.0.3
+ gunicorn==22.0.0
++Unidecode==1.3.8
+diff --git a/tests/test_all.py b/tests/test_all.py
+index 94a3ddd..979b0db 100644
+--- a/tests/test_all.py
++++ b/tests/test_all.py
+@@ -182,31 +182,49 @@ check("dead-at-time penalised", singer.role_score < 0.5, True)
+ 
+ print("\n=== 5. End-to-end with a fake network ===")
+ FIXTURES = {
+-    "sparql": {"results": {"bindings": [
+-        {"p": {"value": "http://www.wikidata.org/entity/Q2831"},
+-         "pLabel": {"value": "Michael Jackson"},
+-         "pDesc": {"value": "American singer (1958-2009)"},
+-         "occ": {"value": "http://www.wikidata.org/entity/Q177220"},
+-         "dob": {"value": "1958-08-29T00:00:00Z"},
+-         "dod": {"value": "2009-06-25T00:00:00Z"}},
+-        {"p": {"value": "http://www.wikidata.org/entity/Q6831397"},
+-         "pLabel": {"value": "Michael Jackson"},
+-         "pDesc": {"value": "English footballer"},
+-         "occ": {"value": "http://www.wikidata.org/entity/Q937857"},
+-         "dob": {"value": "1973-01-01T00:00:00Z"}},
+-    ]}},
+-    "entity": {"entities": {"Q2831": {
+-        "claims": {
+-            "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
+-            "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
+-            "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
+-            "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
+-            "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
+-            "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
++    # wbsearchentities: Wikidata's own fuzzy multilingual index
++    "wbsearchentities": {"search": [{"id": "Q2831"}, {"id": "Q6831397"},
++                                    {"id": "Q1928447"}]},
++    # wbgetentities: humans-only filter + occupation/date detail, one call
++    "wbgetentities": {"entities": {
++        "Q2831": {
++            "labels": {"en": {"value": "Michael Jackson"}},
++            "aliases": {"en": [{"value": "MJ"},
++                               {"value": "The King of Pop"}]},
++            "descriptions": {"en": {"value": "American singer (1958-2009)"}},
++            "claims": {
++                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q177220"}}}}],
++                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1958-08-29T00:00:00Z"}}}}],
++                "P570": [{"mainsnak": {"datavalue": {"value": {"time": "+2009-06-25T00:00:00Z"}}}}],
++                "P2003": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++                "P2002": [{"mainsnak": {"datavalue": {"value": "michaeljackson"}}}],
++                "P345":  [{"mainsnak": {"datavalue": {"value": "nm0001391"}}}],
++                "P1902": [{"mainsnak": {"datavalue": {"value": "3fMbdgg4jU18AjLCKBhRSm"}}}],
++                "P434":  [{"mainsnak": {"datavalue": {"value": "f27ec8db-af05-4f36-916e-3d57f91ecf5e"}}}],
++                "P4985": [{"mainsnak": {"datavalue": {"value": "22226"}}}],
++            },
++            "sitelinks": {"enwiki": {"title": "Michael Jackson"},
++                          "hiwiki": {"title": "\u092e\u093e\u0907\u0915\u0932 \u091c\u0948\u0915\u094d\u0938\u0928"}},
+         },
+-        "sitelinks": {"enwiki": {"title": "Michael Jackson"},
+-                      "hiwiki": {"title": "माइकल जैक्सन"}},
+-    }}},
++        "Q6831397": {
++            "labels": {"en": {"value": "Michael Jackson"}},
++            "descriptions": {"en": {"value": "English footballer"}},
++            "claims": {
++                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q937857"}}}}],
++                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1973-01-01T00:00:00Z"}}}}],
++            }},
++        "Q1928447": {
++            "labels": {"en": {"value": "Michael Jackson"}},
++            "descriptions": {"en": {"value": "British beer writer"}},
++            "claims": {
++                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++                "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q36180"}}}}],
++                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1942-03-27T00:00:00Z"}}}}],
++                "P570": [{"mainsnak": {"datavalue": {"value": {"time": "+2007-08-30T00:00:00Z"}}}}],
++            }},
++    }},
+     "ig_profile": '<html><body><a href="https://linktr.ee/michaeljackson">bio</a></body></html>',
+     "linktree": LINKTREE.replace("arrahman", "michaeljackson")
+                         .replace("ARRahman", "michaeljackson")
+@@ -221,10 +239,10 @@ calls = []
+ 
+ def fake_fetch(url, kind="text"):
+     calls.append(url)
+-    if "sparql" in url:
+-        return FIXTURES["sparql"]
++    if "wbsearchentities" in url:
++        return FIXTURES["wbsearchentities"]
+     if "wbgetentities" in url:
+-        return FIXTURES["entity"]
++        return FIXTURES["wbgetentities"]
+     if "musicbrainz.org/ws" in url:
+         return FIXTURES["mb"]
+     if "instagram.com" in url:
+@@ -261,14 +279,14 @@ check("aggregator-only youtube -> review", "youtube" in review, True)
+ check("linkedin genuinely absent, not invented",
+       "linkedin" in res["handles"] or "linkedin" in review, False)
+ check("collision was recorded",
+-      store.known_collision("michael jackson")["candidate_count"], 2)
++      store.known_collision("michael jackson")["candidate_count"], 3)
+ check("reverse lookup by handle",
+       store.lookup_by_handle(Platform.INSTAGRAM, "MichaelJackson"), "Q2831")
+ 
+ print("\n  -- ambiguous intake must NOT auto-guess --")
+ res2 = resolve(Intake("Michael Jackson"), fake_fetch, EntityStore(":memory:"))
+ check("no hint -> disambiguate", res2["decision"], "disambiguate")
+-check("cards rendered for human", len(res2["cards"]), 2)
++check("cards rendered for human", len(res2["cards"]), 3)
+ check("cards carry occupation", res2["cards"][0]["roles"] != [], True)
+ 
+ 
+diff --git a/tests/test_labels.py b/tests/test_labels.py
+new file mode 100644
+index 0000000..a5a0024
+--- /dev/null
++++ b/tests/test_labels.py
+@@ -0,0 +1,175 @@
++"""Tests for label matching and the Wikidata recall/precision lookup. No network."""
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from identityforge.labels import (LABEL_FLOOR, best_label_match, initials_form,
++                                  match_label, normalize, script_of,
++                                  search_languages, strip_marks, variants)
++from identityforge.wikidata import find_candidates
++from identityforge.resolver import Intake, discover_candidates
++
++PASS = FAIL = 0
++
++
++def check(label, got, want):
++    global PASS, FAIL
++    if got == want:
++        PASS += 1
++        print(f"  ok   {label}")
++    else:
++        FAIL += 1
++        print(f"  FAIL {label}\n         got  {got!r}\n         want {want!r}")
++
++
++print("\n=== 1. Normalisation ===")
++check("initials spaced", normalize("A. R. Rahman"), "a r rahman")
++check("initials unspaced", normalize("A.R. Rahman"), "a r rahman")
++check("no dots", normalize("AR Rahman"), "ar rahman")
++check("diacritics dropped", normalize("Beyoncé Knowles"), "beyonce knowles")
++check("honorific dropped", normalize("Dr. A. R. Rahman"), "a r rahman")
++check("suffix dropped", normalize("Robert Downey Jr."), "robert downey")
++check("ampersand expanded", normalize("Simon & Garfunkel"), "simon and garfunkel")
++check("whitespace collapsed", normalize("  Shah   Rukh  Khan "), "shah rukh khan")
++check("strip_marks keeps case", strip_marks("Ólafur"), "Olafur")
++check("initials form", initials_form("Allah Rakha Rahman"), "a r rahman")
++
++print("\n  -- the exact-match failure this fixes --")
++check("A.R. == A. R. after normalising",
++      normalize("A.R. Rahman") == normalize("A. R. Rahman"), True)
++
++print("\n=== 2. Script detection and search languages ===")
++check("latin", script_of("A. R. Rahman"), "latin")
++check("devanagari", script_of("शाहरुख़ ख़ान"), "devanagari")
++check("tamil", script_of("ஏ. ஆர். ரகுமான்"), "tamil")
++check("katakana", script_of("マイケル・ジャクソン"), "katakana")
++check("cyrillic", script_of("Алла Пугачёва"), "cyrillic")
++check("hindi name searches hi then en", search_languages("शाहरुख़ ख़ान")[:1], ["hi"])
++check("english always included", "en" in search_languages("शाहरुख़ ख़ान"), True)
++check("latin name searches en", search_languages("Rahman"), ["en"])
++
++print("\n=== 3. Variant generation ===")
++v = variants("A.R. Rahman")
++check("original kept first", v[0], "A.R. Rahman")
++check("normalised variant present", "a r rahman" in v, True)
++check("bounded count", len(v) <= 10, True)
++v2 = variants("Dr. Allah Rakha Rahman")
++check("initials variant offered", "a r rahman" in v2, True)
++check("middle names dropped variant", "allah rahman" in v2, True)
++v3 = variants("Knowles, Beyoncé")
++check("last-comma-first flipped", any("beyonc" in x.lower() and
++      x.lower().startswith("beyonc") for x in v3), True)
++check("no duplicates", len(v) == len(set(x.lower() for x in v)), True)
++
++print("\n=== 4. Label match scoring ===")
++check("exact -> 1.0", match_label("A. R. Rahman", "A. R. Rahman").score, 1.0)
++m = match_label("A.R. Rahman", "A. R. Rahman")
++check("punctuation variant -> normalized", m.how, "normalized")
++check("normalized scores high", m.score > 0.9, True)
++m2 = match_label("Allah Rakha Rahman", "A. R. Rahman")
++check("initials match detected", m2.how, "initials")
++m3 = match_label("Michael Jackson", "Michael Jackson")
++check("identical", m3.score, 1.0)
++m4 = match_label("Michael Jackson", "Janet Jackson")
++check("different person scores low", m4.score < LABEL_FLOOR, True)
++m5 = match_label("A. R. Rahman", "Christopher Nolan")
++check("unrelated scores very low", m5.score < 0.4, True)
++
++print("\n  -- cross-script is capped, because transliteration is lossy --")
++m6 = match_label("शाहरुख़ ख़ान", "Shah Rukh Khan")
++check("cross-script never exceeds 0.75", m6.score <= 0.75, True)
++check("best_label_match picks the strongest alias",
++      best_label_match("A.R. Rahman",
++                       ["Christopher Nolan", "A. R. Rahman", "Rahman"]).how,
++      "normalized")
++
++print("\n=== 5. Wikidata recall + precision ===")
++SEARCH = {"search": [
++    {"id": "Q193338"},      # A. R. Rahman
++    {"id": "Q47703"},       # a film that shares the name
++    {"id": "Q999999"},      # different person, same-ish name
++]}
++ENTITIES = {"entities": {
++    "Q193338": {
++        "labels": {"en": {"value": "A. R. Rahman"},
++                   "ta": {"value": "\u0b8f. \u0b86\u0bb0\u0bcd. \u0bb0\u0b95\u0bc1\u0bae\u0bbe\u0ba9\u0bcd"}},
++        "aliases": {"en": [{"value": "Allah Rakha Rahman"},
++                           {"value": "AR Rahman"}]},
++        "descriptions": {"en": {"value": "Indian composer and singer"}},
++        "claims": {
++            "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++            "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q36834"}}}}],
++            "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1967-01-06T00:00:00Z"}}}}],
++            "P27": [{"mainsnak": {"datavalue": {"value": {"id": "Q668"}}}}],
++        }},
++    "Q47703": {                      # NOT a human - must be dropped
++        "labels": {"en": {"value": "Rahman"}},
++        "descriptions": {"en": {"value": "2016 film"}},
++        "claims": {"P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q11424"}}}}]}},
++    "Q999999": {                     # human, but a different name
++        "labels": {"en": {"value": "Christopher Nolan"}},
++        "descriptions": {"en": {"value": "British-American film director"}},
++        "claims": {
++            "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
++            "P106": [{"mainsnak": {"datavalue": {"value": {"id": "Q2526255"}}}}],
++        }},
++}}
++
++
++def wd_fetch(url, kind="text"):
++    if "wbsearchentities" in url:
++        return SEARCH
++    if "wbgetentities" in url:
++        return ENTITIES
++    return {} if kind == "json" else ""
++
++
++res = find_candidates("A.R. Rahman", wd_fetch, expected_role="musician")
++ids = {c.entity_id for c in res["candidates"]}
++check("right person found via punctuation variant", "Q193338" in ids, True)
++check("non-human film dropped", "Q47703" in ids, False)
++check("wrong-name human dropped", "Q999999" in ids, False)
++check("exactly one survivor", len(res["candidates"]), 1)
++why = {d["why"] for d in res["dropped"]}
++check("drop reasons recorded", why, {"not a human (P31)", "label mismatch"})
++
++c = res["candidates"][0]
++check("label match provenance attached", c.label_match["how"], "normalized")
++check("birth year parsed", c.birth_year, 1967)
++check("role derived from occupation", c.roles, ["musician"])
++check("citizenship captured", c.citizenship, ["Q668"])
++check("queries bounded", res["queries_run"] <= 8, True)
++
++print("\n  -- alias path: the full birth name finds the same person --")
++res2 = find_candidates("Allah Rakha Rahman", wd_fetch, expected_role="musician")
++check("alias resolves to same entity",
++      [c.entity_id for c in res2["candidates"]], ["Q193338"])
++# The alias IS one of the entity's labels, so this matches exactly - a
++# stronger result than an initials match, and the right one.
++check("alias matched exactly",
++      res2["candidates"][0].label_match["how"], "exact")
++check("alias match is full confidence",
++      res2["candidates"][0].label_match["score"], 1.0)
++
++print("\n  -- empty and no-hit paths --")
++check("blank name", find_candidates("", wd_fetch)["candidates"], [])
++
++
++def empty_fetch(url, kind="text"):
++    return {"search": []} if "wbsearchentities" in url else {}
++
++
++check("no search hits", find_candidates("Zzz Nobody", empty_fetch)["candidates"], [])
++check("no hits counted", find_candidates("Zzz Nobody", empty_fetch)["hit_ids"], 0)
++
++print("\n=== 6. Resolver uses the new path ===")
++cands = discover_candidates(Intake("A.R. Rahman", expected_role="musician"), wd_fetch)
++check("discover_candidates wired through",
++      [c.entity_id for c in cands], ["Q193338"])
++check("old sparql fn still available for reference",
++      hasattr(sys.modules["identityforge.resolver"], "discover_candidates_sparql"), True)
++
++print(f"\n{'='*54}\n  {PASS} passed, {FAIL} failed\n{'='*54}")
++sys.exit(1 if FAIL else 0)
+-- 
+2.43.0
+
