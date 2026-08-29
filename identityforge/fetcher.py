@@ -26,10 +26,18 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlsplit
 
-DEFAULT_UA = (
-    "IdentityForge/0.2 (ListenFirst Media data operations; "
-    "contact ramesh@listenfirstmedia.com)"
-)
+def default_user_agent() -> str:
+    """
+    Wikimedia's UA policy requires a contact address and will serve 403 to
+    generic agents, so WIKIMEDIA_CONTACT is not decoration - it is what keeps
+    the Wikidata calls working.
+    """
+    contact = os.environ.get("WIKIMEDIA_CONTACT", "").strip()
+    suffix = f"; contact {contact}" if contact else ""
+    return f"IdentityForge/0.3 (ListenFirst Media data operations{suffix})"
+
+
+DEFAULT_UA = default_user_agent()
 
 # MusicBrainz requires <=1 req/sec. Wikidata asks for serial, low-concurrency
 # use and will 429. Everything else gets a conservative default.
@@ -38,8 +46,15 @@ RATE_LIMITS: dict[str, float] = {
     "query.wikidata.org": 1.5,
     "www.wikidata.org": 0.4,
     "api.themoviedb.org": 0.06,
+    "serpapi.com": 0.5,
+    "www.omdbapi.com": 0.2,
     "_default": 1.0,
 }
+
+# Query parameters that must never be written to the cache table or a log.
+# SerpAPI and TMDB v3 both authenticate via the query string, so without this
+# the on-disk cache becomes a plaintext key store.
+SECRET_PARAMS = ("api_key", "apikey", "key", "token", "access_token")
 
 # Only these are ever fetched. An open-ended fetcher pointed at user input is
 # an SSRF hole, so the allowlist is a security control, not just tidiness.
@@ -53,7 +68,22 @@ ALLOWED_SUFFIXES: tuple[str, ...] = (
     "stan.store", "direct.me", "shorby.com", "campsite.bio", "flowcode.com",
     "znap.link", "carrd.co", "about.me", "milkshake.app", "tap.bio",
     "withkoji.com",
+    # API providers
+    "serpapi.com", "omdbapi.com",
 )
+
+
+def redact(url: str) -> str:
+    """Replace secret query values with a placeholder, preserving structure."""
+    if "?" not in url:
+        return url
+    base, _, qs = url.partition("?")
+    parts = []
+    for chunk in qs.split("&"):
+        k, eq, v = chunk.partition("=")
+        parts.append(f"{k}={eq and 'REDACTED'}" if k.lower() in SECRET_PARAMS
+                     else chunk)
+    return f"{base}?{'&'.join(parts)}"
 
 CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS http_cache (
@@ -126,7 +156,7 @@ class CachedFetcher:
 
     # -- cache -----------------------------------------------------------
     def _cache_get(self, url: str) -> Optional[str]:
-        h = hashlib.sha256(url.encode()).hexdigest()
+        h = hashlib.sha256(url.encode()).hexdigest()   # key on full url
         row = self._conn.execute(
             "SELECT body, fetched_at FROM http_cache WHERE url_hash=?", (h,)
         ).fetchone()
@@ -144,7 +174,7 @@ class CachedFetcher:
         h = hashlib.sha256(url.encode()).hexdigest()
         self._conn.execute(
             "INSERT OR REPLACE INTO http_cache VALUES (?,?,?,?,?,?)",
-            (h, url, kind, status, body,
+            (h, redact(url), kind, status, body,
              datetime.now(timezone.utc).isoformat(timespec="seconds")))
         self._conn.commit()
 
@@ -171,7 +201,7 @@ class CachedFetcher:
         self.stats.misses += 1
         self.stats.bytes_in += len(body)
         if len(self.stats.urls) < 200:
-            self.stats.urls.append(url)
+            self.stats.urls.append(redact(url))
         self._cache_put(url, kind, 200, body)
         return self._decode(body, kind)
 
@@ -239,10 +269,26 @@ class FixtureFetcher:
         return {} if kind == "json" else ""
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
 def build_fetcher(offline: bool = False) -> CachedFetcher:
+    """
+    Honours the operator-supplied knobs:
+      CACHE_TTL_SECONDS       (falls back to IF_CACHE_TTL, then 7 days)
+      REQUEST_TIMEOUT_SECONDS (falls back to 20)
+      WIKIMEDIA_CONTACT       (folded into the User-Agent)
+    """
+    ttl = _env_int("CACHE_TTL_SECONDS", _env_int("IF_CACHE_TTL", 7 * 24 * 3600))
     return CachedFetcher(
         cache_path=os.environ.get("IF_CACHE_PATH", "http_cache.db"),
-        ttl_seconds=int(os.environ.get("IF_CACHE_TTL", 7 * 24 * 3600)),
-        user_agent=os.environ.get("IF_USER_AGENT", DEFAULT_UA),
+        ttl_seconds=ttl,
+        user_agent=os.environ.get("IF_USER_AGENT", default_user_agent()),
+        timeout=_env_int("REQUEST_TIMEOUT_SECONDS", 20),
         offline=offline,
     )
+
