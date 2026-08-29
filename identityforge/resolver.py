@@ -37,6 +37,9 @@ from .aggregators import (harvest, is_aggregator_url, looks_like_aggregator,
                           probe_urls, extract_links, extract_sameas)
 from .evidence import (Candidate, Evidence, HandleClaim, Tier, rank,
                        score_role_match)
+from .discovery import attach_as_unverified, discover
+from .providers import enrich_from_tmdb
+from .wikidata import find_candidates
 from .platforms import (Platform, PlatformRef, TARGET_PLATFORMS, build_url,
                         classify_url)
 
@@ -82,6 +85,23 @@ def _qid(uri: str) -> str:
 
 
 def discover_candidates(intake: Intake, fetch: Fetch) -> list[Candidate]:
+    """
+    Wikidata candidate enumeration.
+
+    Delegates to wikidata.find_candidates, which searches Wikidata's own
+    multilingual index across name variants rather than matching labels
+    exactly. The old exact-SPARQL version is kept below as
+    discover_candidates_sparql for reference; it produced silent false
+    negatives on "A.R. Rahman" vs "A. R. Rahman" and on every non-Latin script.
+    """
+    res = find_candidates(intake.name, fetch,
+                          expected_role=intake.expected_role,
+                          country=intake.country,
+                          active_year=intake.active_year)
+    return res["candidates"]
+
+
+def discover_candidates_sparql(intake: Intake, fetch: Fetch) -> list[Candidate]:
     """
     One SPARQL call returns EVERY human with this name/alias, each already a
     distinct entity. This is the step that structurally eliminates your
@@ -405,10 +425,35 @@ def _now() -> str:
 # ---------------------------------------------------------------------------
 
 def resolve(intake: Intake, fetch: Fetch, store: Optional[EntityStore] = None,
-            tmdb_key: str = "", do_bidirectional: bool = True) -> dict:
+            tmdb_key: str = "", do_bidirectional: bool = True,
+            serpapi_key: str = "", serpapi_engine: str = "google",
+            allow_discovery: bool = True) -> dict:
     known = store.known_collision(intake.name) if store else None
 
     candidates = discover_candidates(intake, fetch)
+
+    # No Wikidata item at all - the micro-influencer long tail. Search is the
+    # only way to get a seed here, and everything it returns stays unverified
+    # until the cascade corroborates it.
+    if not candidates and allow_discovery and serpapi_key:
+        disc = discover(intake.name, fetch, serpapi_key,
+                        role=intake.expected_role or "",
+                        engine=serpapi_engine)
+        prov = [p.as_dict() for p in disc.proposals]
+        result = {"decision": "unverified_only",
+                  "reason": ("No entity in the identity graph, so nothing can be "
+                             "verified structurally. These are search proposals "
+                             "only - confirm one before use."),
+                  "proposals": prov,
+                  "proposals_by_platform": disc.by_platform(),
+                  "aggregator_urls": disc.aggregator_urls,
+                  "queries_run": disc.queries_run,
+                  "errors": disc.errors,
+                  "candidates": [], "cards": []}
+        if store:
+            store.log(intake, {"decision": "unverified_only", "winner": None})
+        return result
+
     if store and len(candidates) > 1:
         store.record_collision(intake.name, candidates)
 
@@ -432,8 +477,10 @@ def resolve(intake: Intake, fetch: Fetch, store: Optional[EntityStore] = None,
 
     cand: Candidate = decision["winner"]
     harvest_structured_ids(cand, fetch)
+    provider_info: dict = {}
     if tmdb_key:
-        fill_from_tmdb(cand, fetch, tmdb_key)
+        provider_info["tmdb"] = enrich_from_tmdb(
+            cand, fetch, tmdb_key, intake.expected_role)
     fill_from_musicbrainz(cand, fetch)
 
     # seed for the cascade: prefer a platform whose bio reliably carries a link
@@ -456,6 +503,7 @@ def resolve(intake: Intake, fetch: Fetch, store: Optional[EntityStore] = None,
 
     return {
         "decision": "resolved",
+        "provider_info": provider_info,
         "entity_id": cand.entity_id,
         "label": cand.label,
         "roles": cand.roles,
