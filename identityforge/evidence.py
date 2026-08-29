@@ -33,7 +33,7 @@ TIER_WEIGHT: dict[Tier, float] = {
     Tier.BIDIRECTIONAL: 0.78,   # gold standard: sufficient alone
     Tier.STRUCTURED_ID: 0.55,
     Tier.SELF_DECLARED: 0.45,   # structured + self-declared must clear 0.75
-    Tier.CORROBORATING: 0.15,
+    Tier.CORROBORATING: 0.38,   # alone -> review (worth a glance), never accept
     Tier.NAME_MATCH: 0.00,
 }
 
@@ -127,6 +127,10 @@ class Candidate:
     claims: dict[str, HandleClaim] = field(default_factory=dict)
     role_score: float = 0.0
     thumbnail: str = ""
+    label_match: dict = field(default_factory=dict)
+    """How the queried name matched this entity: {score, how, matched}.
+    'how' is exact | normalized | initials | token | fuzzy | translit — worth
+    surfacing, because a 'translit' match deserves more scrutiny than 'exact'."""
 
     def add_claim(self, ref: PlatformRef, ev: Evidence) -> None:
         k = ref.key()
