@@ -122,7 +122,7 @@ def canon_header(raw: str, strict: bool = False) -> Optional[str]:
 
 
 def score_header_row(row: list) -> int:
-    """How many cells in \`row\` are recognisable column headings, strictly."""
+    """How many cells in `row` are recognisable column headings, strictly."""
     seen = set()
     for cell in row:
         c = canon_header(cell, strict=True)
