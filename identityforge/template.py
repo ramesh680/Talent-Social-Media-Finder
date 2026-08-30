@@ -11,43 +11,26 @@ from __future__ import annotations
 import io
 
 from .authorities import OCCUPATION_BUCKETS
-from .bulk import COUNTRY_QIDS, INPUT_COLUMNS, OUTPUT_COLUMNS
+from .bulk import OUTPUT_COLUMNS, TEMPLATE_COLUMNS
 
 EXAMPLE_ROWS = [
-    ["1", "A. R. Rahman", "musician", 2010, "India",
-     "Slumdog Millionaire soundtrack", "Sony Music",
-     "punctuation variant of the name is fine"],
-    ["2", "Michael Jackson", "musician", 2005, "United States",
-     "Sony catalogue", "Sony Music",
-     "same name as a footballer and a beer writer - role decides"],
-    ["3", "Michael Jackson", "athlete", 2000, "United Kingdom", "", "",
-     "same name, different person, different role hint"],
-    ["4", "Christopher Nolan", "director", 2023, "United Kingdom",
-     "Oppenheimer", "Universal", ""],
-    ["5", "Priyanka Chopra", "actor", 2022, "India", "Citadel", "Prime Video",
-     "married name Priyanka Chopra Jonas also matches"],
-    ["6", "शाहरुख़ ख़ान", "actor", 2023, "India", "Jawan", "",
-     "non-Latin script is supported - searched in its own language"],
+    ["A. R. Rahman", "musician"],
+    ["Michael Jackson", "musician"],
+    ["Michael Jackson", "athlete"],
+    ["Christopher Nolan", "director"],
+    ["Priyanka Chopra", "actor"],
+    ["\u0936\u093e\u0939\u0930\u0941\u0916\u093c \u0916\u093c\u093e\u0928", "actor"],
 ]
 
 NOTES = [
-    ("name", "REQUIRED", "The person's name as you have it. Punctuation, "
-     "missing diacritics and initials variants are handled ('A.R. Rahman', "
+    ("name", "REQUIRED", "The talent's name as you have it. Punctuation, "
+     "missing diacritics and initials variants are all handled ('A.R. Rahman', "
      "'AR Rahman', 'Beyonce'). Non-Latin scripts are searched in their own "
-     "language."),
-    ("role", "Strongly recommended", "The single most valuable field. Without "
-     "it, a shared name returns 'disambiguate' instead of an answer. You "
-     "usually already have it: title_category implies it."),
-    ("active_year", "Optional", "Year the person was relevant to this request. "
-     "Rules out candidates who were dead or unborn then."),
-    ("country", "Optional", "Country name or a Wikidata Q-id. Helps separate "
-     "same-name people in different markets."),
-    ("context", "Optional", "Show, brand or campaign. Recorded for audit; not "
-     "used for matching yet."),
-    ("client", "Optional", "Your account or brand set. Recorded for audit."),
-    ("row_id", "Optional", "Your own identifier, echoed back so you can join "
-     "the results to your source sheet. Auto-numbered if blank."),
-    ("notes", "Optional", "Free text, passed through to the output."),
+     "language, so Devanagari or Tamil spellings work as-is."),
+    ("profession", "Strongly recommended", "What the person does. This is the "
+     "field that separates same-named people - without it, a shared name comes "
+     "back as 'disambiguate' instead of an answer. Common words are mapped "
+     "automatically: singer, actress, footballer, influencer all work."),
 ]
 
 DECISIONS = [
@@ -95,8 +78,8 @@ def build_template_xlsx() -> bytes:
     ws["A3"] = ("Fill in the Input sheet, then upload it at "
                 "https://talent-social-finder.onrender.com")
     ws["A3"].font = body
-    ws["A4"] = ("Delete the six grey example rows before uploading. Only "
-                "'name' is required; everything else improves accuracy.")
+    ws["A4"] = ("Two columns only: the talent's name, and what they do. "
+                "Delete the six grey example rows before uploading.")
     ws["A4"].font = body
 
     ws["A6"] = "Columns"
@@ -159,8 +142,8 @@ def build_template_xlsx() -> bytes:
 
     # ---------------- Input ----------------
     inp = wb.create_sheet("Input")
-    inp.append(INPUT_COLUMNS)
-    for c in range(1, len(INPUT_COLUMNS) + 1):
+    inp.append(TEMPLATE_COLUMNS)
+    for c in range(1, len(TEMPLATE_COLUMNS) + 1):
         cell = inp.cell(row=1, column=c)
         cell.font = head_font
         cell.fill = head_fill
@@ -168,16 +151,16 @@ def build_template_xlsx() -> bytes:
 
     for ex in EXAMPLE_ROWS:
         inp.append(ex)
-        for c in range(1, len(INPUT_COLUMNS) + 1):
+        for c in range(1, len(TEMPLATE_COLUMNS) + 1):
             cell = inp.cell(row=inp.max_row, column=c)
             cell.font = example_font
             cell.fill = example_fill
             cell.border = box
 
     # blank rows the operator fills in, marked yellow
-    for _ in range(40):
-        inp.append([""] * len(INPUT_COLUMNS))
-        for c in range(1, len(INPUT_COLUMNS) + 1):
+    for _ in range(60):
+        inp.append([""] * len(TEMPLATE_COLUMNS))
+        for c in range(1, len(TEMPLATE_COLUMNS) + 1):
             cell = inp.cell(row=inp.max_row, column=c)
             cell.font = body
             cell.fill = input_fill
@@ -187,21 +170,22 @@ def build_template_xlsx() -> bytes:
     dv = DataValidation(type="list", formula1='"' + ",".join(roles) + '"',
                         allow_blank=True, showDropDown=False)
     dv.error = "Pick a role from the list, or leave blank."
-    dv.prompt = "Optional but strongly recommended - it is what resolves collisions."
+    dv.prompt = "Strongly recommended - it is what resolves same-name collisions."
     inp.add_data_validation(dv)
-    dv.add(f"C2:C{inp.max_row}")
+    dv.add(f"B2:B{inp.max_row}")
 
-    widths = {"row_id": 9, "name": 26, "role": 15, "active_year": 12,
-              "country": 18, "context": 32, "client": 16, "notes": 44}
-    for i, col in enumerate(INPUT_COLUMNS, start=1):
-        inp.column_dimensions[get_column_letter(i)].width = widths.get(col, 16)
-    inp.freeze_panes = "B2"
+    widths = {"name": 34, "profession": 22}
+    for i, col in enumerate(TEMPLATE_COLUMNS, start=1):
+        inp.column_dimensions[get_column_letter(i)].width = widths.get(col, 20)
+    inp.freeze_panes = "A2"
 
     # ---------------- Reference ----------------
     ref = wb.create_sheet("Reference")
     ref["A1"] = "Valid role values"
     ref["A1"].font = Font(name="Arial", bold=True, size=11, color=NAVY)
-    ref["A2"] = "Use exactly these. Common synonyms are mapped automatically."
+    ref["A2"] = ("Use any of these in the profession column. Common synonyms "
+                 "are mapped automatically, and an unrecognised value is "
+                 "ignored rather than guessed at.")
     ref["A2"].font = body
     r = 4
     ref.cell(row=r, column=1, value="role").font = head_font
@@ -230,19 +214,6 @@ def build_template_xlsx() -> bytes:
         ref.cell(row=r, column=2).border = box
 
     r += 3
-    ref.cell(row=r, column=1, value="Recognised country names").font = \
-        Font(name="Arial", bold=True, size=11, color=NAVY)
-    r += 1
-    ref.cell(row=r, column=1,
-             value="Any of these, or a raw Wikidata Q-id. "
-                   "Unrecognised values pass through unchanged.").font = body
-    r += 1
-    names = sorted({k.title() for k in COUNTRY_QIDS})
-    for i in range(0, len(names), 6):
-        r += 1
-        ref.cell(row=r, column=1, value=", ".join(names[i:i + 6])).font = body
-
-    r += 3
     ref.cell(row=r, column=1, value="Output columns you will get back").font = \
         Font(name="Arial", bold=True, size=11, color=NAVY)
     r += 1
@@ -261,7 +232,7 @@ def build_template_csv() -> bytes:
     import csv
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(INPUT_COLUMNS)
+    w.writerow(TEMPLATE_COLUMNS)
     for ex in EXAMPLE_ROWS:
         w.writerow(ex)
     return buf.getvalue().encode("utf-8-sig")
