@@ -41,6 +41,14 @@ INPUT_COLUMNS = ["row_id", "name", "role", "active_year", "country",
                  "context", "client", "notes"]
 REQUIRED_COLUMNS = ["name"]
 
+# What the downloadable TEMPLATE asks for. Deliberately just two columns: the
+# other fields cost real lookup effort per row and buy far less than role does
+# (role scores 0.60 in the discriminator; country and year only 0.15 each).
+#
+# Note this is the template, NOT the parser. Every column in INPUT_COLUMNS is
+# still accepted if a sheet happens to carry it, so older sheets keep working.
+TEMPLATE_COLUMNS = ["name", "profession"]
+
 PLATFORM_ORDER = [Platform.FACEBOOK, Platform.INSTAGRAM, Platform.TWITTER,
                   Platform.YOUTUBE, Platform.WIKIPEDIA, Platform.IMDB,
                   Platform.TIKTOK, Platform.LINKEDIN]
