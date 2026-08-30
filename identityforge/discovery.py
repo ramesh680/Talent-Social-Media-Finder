@@ -49,6 +49,24 @@ _PLATFORM_QUERY = {
     Platform.WIKIPEDIA: "site:wikipedia.org {name} {role}",
 }
 
+# Which platforms are worth a paid query first, per role. Each query is a
+# BILLED SerpAPI search, so ordering matters more than completeness: for a
+# musician, Instagram and YouTube carry the cluster; LinkedIn almost never does.
+ROLE_PLATFORM_PRIORITY: dict[str, list[Platform]] = {
+    "musician": [Platform.INSTAGRAM, Platform.YOUTUBE, Platform.TIKTOK,
+                 Platform.TWITTER, Platform.FACEBOOK],
+    "creator": [Platform.INSTAGRAM, Platform.TIKTOK, Platform.YOUTUBE,
+                Platform.TWITTER],
+    "actor": [Platform.INSTAGRAM, Platform.IMDB, Platform.TWITTER,
+              Platform.FACEBOOK],
+    "director": [Platform.IMDB, Platform.INSTAGRAM, Platform.TWITTER],
+    "athlete": [Platform.INSTAGRAM, Platform.TWITTER, Platform.FACEBOOK],
+    "executive": [Platform.LINKEDIN, Platform.TWITTER],
+    "journalist": [Platform.TWITTER, Platform.LINKEDIN, Platform.INSTAGRAM],
+    "_default": [Platform.INSTAGRAM, Platform.TWITTER, Platform.YOUTUBE,
+                 Platform.TIKTOK],
+}
+
 # The aggregator sweep is the highest-value single query in this module: one hit
 # yields the whole cluster, self-declared, which the pipeline can then trust.
 _AGGREGATOR_QUERY = (
@@ -84,6 +102,7 @@ class DiscoveryResult:
     proposals: list[Proposal] = field(default_factory=list)
     aggregator_urls: list[str] = field(default_factory=list)
     queries_run: int = 0
+    stopped_early: str = ""
     errors: list[str] = field(default_factory=list)
 
     def by_platform(self) -> dict[str, list[dict]]:
@@ -114,12 +133,20 @@ def _organic(data) -> list[dict]:
 def discover(name: str, fetch, api_key: str, role: str = "",
              engine: str = "google",
              platforms: Optional[list[Platform]] = None,
-             include_aggregators: bool = True) -> DiscoveryResult:
+             include_aggregators: bool = True,
+             max_queries: int = 4) -> DiscoveryResult:
     """
     Ask a search engine what handles might belong to this name.
 
     Every returned Proposal is unverified. Feed the aggregator_urls into the
     normal cascade to turn guesses into Tier-2 evidence.
+
+    BUDGETED, because every query is a billed SerpAPI search. Querying all
+    eight platforms cost 9 searches per name - a 25-name sheet burned 225,
+    which is over twice the entire free tier for one upload. So: sweep the
+    link-in-bio hosts first, and if that hits, stop. One aggregator page yields
+    the whole cluster anyway, and it yields it as self-declared evidence rather
+    than as a search guess, which is strictly better.
     """
     res = DiscoveryResult()
     if not api_key:
@@ -141,9 +168,20 @@ def discover(name: str, fetch, api_key: str, role: str = "",
             link = row.get("link") or ""
             if link and link not in res.aggregator_urls:
                 res.aggregator_urls.append(link)
+        # A link-in-bio hit makes further paid queries pointless: the cascade
+        # will read every platform off that one page, self-declared.
+        if res.aggregator_urls:
+            res.stopped_early = "aggregator found - platform queries skipped"
+            return res
 
-    # 2. per-platform site-scoped queries
-    for plat in (platforms or list(_PLATFORM_QUERY)):
+    # 2. per-platform site-scoped queries, best-first for the role, capped
+    ordered = platforms or ROLE_PLATFORM_PRIORITY.get(
+        role or "_default", ROLE_PLATFORM_PRIORITY["_default"])
+    for plat in ordered:
+        if res.queries_run >= max_queries:
+            res.stopped_early = f"query budget of {max_queries} reached"
+            break
+
         tmpl = _PLATFORM_QUERY.get(plat)
         if not tmpl:
             continue
