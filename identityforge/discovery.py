@@ -52,9 +52,29 @@ _PLATFORM_QUERY = {
 # Which platforms are worth a paid query first, per role. Each query is a
 # BILLED SerpAPI search, so ordering matters more than completeness: for a
 # musician, Instagram and YouTube carry the cluster; LinkedIn almost never does.
+# Search order, set by the operator who actually does this work:
+#   1. link-in-bio aggregators   2. Wikipedia   3. Instagram, X, Facebook,
+#   TikTok, YouTube, IMDb
+#
+# The first two are the cheap, high-yield steps and both can end the search:
+# an aggregator page yields the whole cluster self-declared, and a Wikipedia
+# hit bridges back to a Wikidata Q-id which yields every structured ID free.
+# The per-platform searches are the expensive fallback, tried only when the
+# cheap routes come up empty.
+PLATFORM_SEARCH_ORDER: list[Platform] = [
+    Platform.INSTAGRAM,
+    Platform.TWITTER,
+    Platform.FACEBOOK,
+    Platform.TIKTOK,
+    Platform.YOUTUBE,
+    Platform.IMDB,
+]
+
+# Role only reprioritises within that order; it never adds platforms the
+# operator did not ask for.
 ROLE_PLATFORM_PRIORITY: dict[str, list[Platform]] = {
-    "musician": [Platform.INSTAGRAM, Platform.YOUTUBE, Platform.TIKTOK,
-                 Platform.TWITTER, Platform.FACEBOOK],
+    "musician": [Platform.INSTAGRAM, Platform.TWITTER, Platform.TIKTOK,
+                 Platform.YOUTUBE, Platform.FACEBOOK],
     "creator": [Platform.INSTAGRAM, Platform.TIKTOK, Platform.YOUTUBE,
                 Platform.TWITTER],
     "actor": [Platform.INSTAGRAM, Platform.IMDB, Platform.TWITTER,
@@ -63,9 +83,17 @@ ROLE_PLATFORM_PRIORITY: dict[str, list[Platform]] = {
     "athlete": [Platform.INSTAGRAM, Platform.TWITTER, Platform.FACEBOOK],
     "executive": [Platform.LINKEDIN, Platform.TWITTER],
     "journalist": [Platform.TWITTER, Platform.LINKEDIN, Platform.INSTAGRAM],
-    "_default": [Platform.INSTAGRAM, Platform.TWITTER, Platform.YOUTUBE,
-                 Platform.TIKTOK],
+    "_default": PLATFORM_SEARCH_ORDER,
 }
+
+WIKIPEDIA_QUERY = 'site:wikipedia.org {name} {role}'
+
+# Paid-search budget per name. This is THE cost lever:
+#   names x max_queries = SerpAPI searches.
+# Worst case only; the aggregator and Wikipedia steps exit early when they hit,
+# so well-covered talent costs 1-2 searches and only true unknowns spend the
+# full budget.
+DEFAULT_MAX_QUERIES = int(os.environ.get("SERPAPI_MAX_QUERIES", 6))
 
 # The aggregator sweep is the highest-value single query in this module: one hit
 # yields the whole cluster, self-declared, which the pipeline can then trust.
@@ -101,6 +129,8 @@ class Proposal:
 class DiscoveryResult:
     proposals: list[Proposal] = field(default_factory=list)
     aggregator_urls: list[str] = field(default_factory=list)
+    wikipedia_urls: list[str] = field(default_factory=list)
+    bridged_qids: list[str] = field(default_factory=list)
     queries_run: int = 0
     stopped_early: str = ""
     errors: list[str] = field(default_factory=list)
@@ -134,7 +164,8 @@ def discover(name: str, fetch, api_key: str, role: str = "",
              engine: str = "google",
              platforms: Optional[list[Platform]] = None,
              include_aggregators: bool = True,
-             max_queries: int = 4) -> DiscoveryResult:
+             include_wikipedia: bool = True,
+             max_queries: int = DEFAULT_MAX_QUERIES) -> DiscoveryResult:
     """
     Ask a search engine what handles might belong to this name.
 
@@ -174,14 +205,41 @@ def discover(name: str, fetch, api_key: str, role: str = "",
             res.stopped_early = "aggregator found - platform queries skipped"
             return res
 
-    # 2. per-platform site-scoped queries, best-first for the role, capped
+    # 2. Wikipedia. Second by design: an article maps 1:1 to a Wikidata item,
+    #    so one paid search can be converted into a Q-id and then into every
+    #    structured platform ID for free. Google also fuzzy-matches names far
+    #    better than an exact label lookup, so this rescues people who ARE in
+    #    Wikidata but whose spelling did not match what the operator typed.
+    if include_wikipedia and res.queries_run < max_queries:
+        q = WIKIPEDIA_QUERY.format(name=f'"{name}"', role=role).strip()
+        data = fetch(_serp_url(q, api_key, engine), kind="json")
+        res.queries_run += 1
+        for i, row in enumerate(_organic(data), 1):
+            link = row.get("link") or ""
+            ref = classify_url(link)
+            if ref and ref.platform is Platform.WIKIPEDIA:
+                if link not in res.wikipedia_urls:
+                    res.wikipedia_urls.append(link)
+                if not any(p.ref.key() == ref.key() for p in res.proposals):
+                    title = row.get("title") or ""
+                    res.proposals.append(Proposal(
+                        ref=ref, query=q, rank=i, title=title,
+                        snippet=(row.get("snippet") or "")[:200],
+                        name_in_title=name_key in _norm(title)))
+        # A Wikipedia hit is a bridge to structured data, so stop paying for
+        # platform guesses - the caller will harvest the Q-item instead.
+        if res.wikipedia_urls:
+            res.stopped_early = ("wikipedia found - bridging to Wikidata "
+                                 "instead of paid platform queries")
+            return res
+
+    # 3. per-platform site-scoped queries, best-first for the role, capped
     ordered = platforms or ROLE_PLATFORM_PRIORITY.get(
         role or "_default", ROLE_PLATFORM_PRIORITY["_default"])
     for plat in ordered:
         if res.queries_run >= max_queries:
             res.stopped_early = f"query budget of {max_queries} reached"
             break
-
         tmpl = _PLATFORM_QUERY.get(plat)
         if not tmpl:
             continue
