@@ -20,8 +20,12 @@ import json
 import os
 from flask import Flask, jsonify, render_template, request
 
+from flask import Response, send_file
+
 from identityforge import authorities
 from identityforge.authorities import OCCUPATION_BUCKETS
+from identityforge import bulk as bulk_mod
+from identityforge.template import build_template_csv, build_template_xlsx
 from identityforge.discovery import discover
 from identityforge.fetcher import CachedFetcher, FixtureFetcher, build_fetcher
 from identityforge.providers import omdb_title, search_person
@@ -146,7 +150,7 @@ def index():
 def health():
     return jsonify({"ok": True, "mode": "live" if LIVE else "demo",
                     "tmdb_key_present": _present(TMDB_KEY),
-                    "version": "0.4.0"})
+                    "version": "0.5.0"})
 
 
 @app.get("/api/config")
@@ -307,6 +311,140 @@ def api_omdb_title():
         return jsonify({"error": "OMDB_API_KEY is not configured."}), 503
     return jsonify(omdb_title(q, _fetcher(), OMDB_KEY) or
                    {"error": "Not found in OMDb."})
+
+
+# ---------------------------------------------------------------------------
+# bulk upload
+# ---------------------------------------------------------------------------
+
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+
+
+@app.get("/api/template.xlsx")
+def template_xlsx():
+    data = build_template_xlsx()
+    return Response(
+        data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 'attachment; filename="talent-finder-template.xlsx"'})
+
+
+@app.get("/api/template.csv")
+def template_csv():
+    return Response(build_template_csv(), mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             'attachment; filename="talent-finder-template.csv"'})
+
+
+@app.post("/api/bulk/validate")
+def bulk_validate():
+    """
+    Parse and report WITHOUT resolving anything.
+
+    Worth its own endpoint: it tells the operator how their headers were read
+    and which rows will be skipped, before spending any upstream quota.
+    """
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded (form field 'file')."}), 400
+    data = f.read()
+    if not data:
+        return jsonify({"error": "The uploaded file is empty."}), 400
+
+    parsed = bulk_mod.parse_upload(f.filename or "", data)
+    if parsed.errors:
+        return jsonify({"error": parsed.errors[0], "errors": parsed.errors,
+                        "header_map": parsed.header_map,
+                        "unmapped_headers": parsed.unmapped_headers}), 422
+
+    return jsonify({
+        "filename": f.filename,
+        "header_map": parsed.header_map,
+        "unmapped_headers": parsed.unmapped_headers,
+        "total_rows": len(parsed.rows),
+        "valid_rows": len(parsed.valid_rows),
+        "skipped_rows": [{"row_number": r.row_number,
+                          "why": "; ".join(r.warnings) or "empty name"}
+                         for r in parsed.invalid_rows],
+        "warnings": [{"row_number": r.row_number, "warnings": r.warnings}
+                     for r in parsed.valid_rows if r.warnings][:50],
+        "with_role": sum(1 for r in parsed.valid_rows if r.role),
+        "without_role": sum(1 for r in parsed.valid_rows if not r.role),
+        "preview": [{"row_id": r.row_id, "name": r.name, "role": r.role,
+                     "active_year": r.active_year, "country": r.country}
+                    for r in parsed.valid_rows[:10]],
+        "note": ("Rows without a role will usually come back as "
+                 "'disambiguate' if the name is shared."),
+    })
+
+
+@app.post("/api/bulk")
+def bulk_resolve():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded (form field 'file')."}), 400
+    data = f.read()
+    if not data:
+        return jsonify({"error": "The uploaded file is empty."}), 400
+
+    parsed = bulk_mod.parse_upload(f.filename or "", data)
+    if parsed.errors:
+        return jsonify({"error": parsed.errors[0],
+                        "errors": parsed.errors}), 422
+    if not parsed.valid_rows:
+        return jsonify({"error": "No rows with a name were found."}), 422
+
+    try:
+        max_rows = min(int(request.form.get("max_rows", 500)), 1000)
+    except ValueError:
+        max_rows = 500
+    try:
+        budget = min(float(request.form.get("budget_seconds", 75)), 100.0)
+    except ValueError:
+        budget = 75.0
+
+    fetch = _fetcher()
+
+    def resolve_one(pr):
+        return resolve(
+            Intake(name=pr.name, expected_role=pr.role or None,
+                   country=pr.country or None, active_year=pr.active_year,
+                   context=pr.context, client=pr.client),
+            fetch, _store, tmdb_key=TMDB_KEY, do_bidirectional=False,
+            serpapi_key=SERPAPI_KEY, serpapi_engine=SERPAPI_ENGINE)
+
+    batch = bulk_mod.run_batch(parsed, resolve_one, max_rows=max_rows,
+                               time_budget_seconds=budget)
+    payload = batch.as_dict()
+    payload["mode"] = "live" if LIVE else "demo"
+    payload["header_map"] = parsed.header_map
+    counts: dict[str, int] = {}
+    for r in batch.rows:
+        d = str(r.get("decision", "?"))
+        counts[d] = counts.get(d, 0) + 1
+    payload["decision_counts"] = counts
+    return jsonify(payload)
+
+
+@app.post("/api/bulk/export")
+def bulk_export():
+    """Turn a JSON result set back into a downloadable sheet."""
+    body = request.get_json(silent=True) or {}
+    rows = body.get("rows") or []
+    if not isinstance(rows, list) or not rows:
+        return jsonify({"error": "No rows to export."}), 400
+    fmt = (body.get("format") or "xlsx").lower()
+    if fmt == "csv":
+        return Response(bulk_mod.to_csv(rows), mimetype="text/csv",
+                        headers={"Content-Disposition":
+                                 'attachment; filename="talent-finder-results.csv"'})
+    return Response(
+        bulk_mod.to_xlsx(rows),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 'attachment; filename="talent-finder-results.xlsx"'})
 
 
 if __name__ == "__main__":
