@@ -136,6 +136,36 @@ td.v{font-family:"IBM Plex Mono",monospace;word-break:break-all}
   border-radius:3px;font-size:14px}
 footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
   font-size:12.5px;color:var(--muted)}
+.tabs{display:flex;gap:2px;margin-top:-18px}
+.tab{padding:9px 18px;background:#E6EAF1;border:1px solid var(--rule);
+  border-bottom:0;border-radius:3px 3px 0 0;cursor:pointer;
+  font:500 13px "IBM Plex Sans",sans-serif;color:var(--ink-soft)}
+.tab[aria-selected="true"]{background:var(--card);color:var(--ink)}
+.panel.tabbed{margin-top:0;border-radius:0 3px 3px 3px}
+.drop{border:1px dashed var(--rule);border-radius:3px;padding:26px;
+  text-align:center;background:#FCFDFE}
+.drop.over{border-color:var(--structured);background:#F4F6FD}
+.drop p{margin:6px 0;color:var(--ink-soft);font-size:14px}
+.linkbtn{background:none;border:0;color:var(--structured);cursor:pointer;
+  padding:0;font:500 14px "IBM Plex Sans",sans-serif;text-decoration:underline}
+.counts{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.count{padding:6px 12px;border-radius:2px;font-family:"IBM Plex Mono",monospace;
+  font-size:12px;border:1px solid var(--rule);background:var(--card)}
+.count b{font-weight:500}
+.count.resolved{border-left:3px solid var(--accept)}
+.count.disambiguate,.count.unverified_only{border-left:3px solid var(--review)}
+.count.not_found,.count.error{border-left:3px solid var(--reject)}
+.scroll{overflow-x:auto;border:1px solid var(--rule);border-radius:3px}
+.scroll table{border:0;font-size:12.5px;min-width:1100px}
+.scroll td{white-space:nowrap;max-width:260px;overflow:hidden;
+  text-overflow:ellipsis;font-family:"IBM Plex Mono",monospace}
+.dec{font-family:"IBM Plex Mono",monospace;font-size:11px;padding:2px 7px;
+  border-radius:2px}
+.dec.resolved{background:#E4F2EC;color:var(--accept)}
+.dec.disambiguate,.dec.unverified_only{background:#FDF3E0;color:var(--review)}
+.dec.not_found,.dec.error{background:#FBECEB;color:var(--reject)}
+.warnbox{border-left:3px solid var(--review);background:#FDF9F0;padding:12px 16px;
+  border-radius:3px;font-size:13.5px;margin-top:12px}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid #fff;
   border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;
   vertical-align:-2px;margin-right:8px}
@@ -156,7 +186,12 @@ footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
 </header>
 
 <main>
-  <div class="panel">
+  <div class="tabs" role="tablist">
+    <button class="tab" id="tab-single" role="tab" aria-selected="true">Single name</button>
+    <button class="tab" id="tab-bulk" role="tab" aria-selected="false">Bulk upload</button>
+  </div>
+
+  <div class="panel tabbed" id="pane-single">
     <div class="grid">
       <div>
         <label for="name">Name</label>
@@ -184,6 +219,32 @@ footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
     </div>
     <p class="hint">Role comes free from your ingest data — <code>title_category</code>
       already implies it. Leave it unknown to see what happens on a collision.</p>
+  </div>
+
+  <div class="panel tabbed" id="pane-bulk" hidden>
+    <div class="drop" id="drop">
+      <p><strong>Drop a .xlsx or .csv here</strong>, or
+        <button class="linkbtn" id="pick">choose a file</button></p>
+      <input type="file" id="file" accept=".xlsx,.xlsm,.csv,.tsv" hidden>
+      <p id="fname" class="mono" style="font-size:13px"></p>
+      <p>Only a <code>name</code> column is required. Headers are matched
+         loosely — <code>Talent Name</code>, <code>Title</code> and
+         <code>title_category</code> all work.</p>
+    </div>
+    <div class="row2">
+      <div class="field">
+        <label for="maxrows">Max rows this run</label>
+        <input id="maxrows" value="25" inputmode="numeric">
+      </div>
+      <button id="btn-validate" style="background:#E6EAF1;color:var(--ink)">Check file only</button>
+      <button id="btn-bulk" disabled>Resolve all rows</button>
+    </div>
+    <p class="hint">Download the template:
+      <a href="/api/template.xlsx">Excel</a> ·
+      <a href="/api/template.csv">CSV</a>.
+      A live run costs roughly 5–10s per name because upstream rate limits are
+      respected, so keep batches small and resubmit what comes back as
+      unprocessed.</p>
   </div>
 
   <div id="out"></div>
@@ -320,6 +381,173 @@ async function run(){
 }
 $("#go").addEventListener("click", run);
 $("#name").addEventListener("keydown", e => { if(e.key==="Enter") run(); });
+
+/* ---------------- bulk upload ---------------- */
+let chosen = null;
+
+function showTab(which){
+  const single = which === "single";
+  $("#tab-single").setAttribute("aria-selected", single);
+  $("#tab-bulk").setAttribute("aria-selected", !single);
+  $("#pane-single").hidden = !single;
+  $("#pane-bulk").hidden = single;
+  out.innerHTML = "";
+}
+$("#tab-single").addEventListener("click", () => showTab("single"));
+$("#tab-bulk").addEventListener("click", () => showTab("bulk"));
+
+const drop = $("#drop"), fileInput = $("#file");
+$("#pick").addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => setFile(fileInput.files[0]));
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => setFile(e.dataTransfer.files[0]));
+
+function setFile(f){
+  if (!f) return;
+  chosen = f;
+  $("#fname").textContent = f.name + " · " + Math.ceil(f.size/1024) + " KB";
+  $("#btn-bulk").disabled = false;
+}
+
+async function post(url, form){
+  const r = await fetch(url, {method:"POST", body:form});
+  return {status:r.status, data: await r.json()};
+}
+
+function countsHtml(counts){
+  const keys = Object.keys(counts||{});
+  if (!keys.length) return "";
+  return '<div class="counts">' + keys.map(k =>
+    `<span class="count ${esc(k)}"><b>${counts[k]}</b> ${esc(k)}</span>`
+  ).join("") + "</div>";
+}
+
+function mapHtml(m){
+  const keys = Object.keys(m||{});
+  if (!keys.length) return "";
+  return `<table><thead><tr><th>your header</th><th>read as</th></tr></thead><tbody>`
+    + keys.map(k => `<tr><td class="k">${esc(k)}</td><td class="v">${esc(m[k])}</td></tr>`).join("")
+    + `</tbody></table>`;
+}
+
+async function validateFile(){
+  if (!chosen) return;
+  const btn = $("#btn-validate"); btn.disabled = true;
+  out.innerHTML = "";
+  try{
+    const fd = new FormData(); fd.append("file", chosen);
+    const {status, data} = await post("/api/bulk/validate", fd);
+    if (status >= 400){
+      out.innerHTML = `<section><div class="err"><strong>${esc(data.error)}</strong>
+        ${data.unmapped_headers && data.unmapped_headers.length
+          ? "<br>Unrecognised headers: " + esc(data.unmapped_headers.join(", ")) : ""}
+        </div></section>`;
+      return;
+    }
+    let h = `<section><div class="decision"><h2>File looks readable</h2>
+      <p>${data.valid_rows} rows with a name, ${data.without_role} of them with
+      no role hint.</p></div></section>`;
+    if (data.without_role > 0)
+      h += `<section><div class="warnbox">${data.without_role} row(s) have no
+        role. On a shared name those come back as <code>disambiguate</code>
+        rather than an answer — worth filling in first.</div></section>`;
+    if ((data.skipped_rows||[]).length)
+      h += `<section><div class="warnbox">${data.skipped_rows.length} row(s)
+        will be skipped (no name).</div></section>`;
+    h += `<section><h3>How your headers were read</h3>${mapHtml(data.header_map)}`;
+    if ((data.unmapped_headers||[]).length)
+      h += `<p class="hint">Ignored: ${esc(data.unmapped_headers.join(", "))}</p>`;
+    h += `</section>`;
+    if ((data.preview||[]).length){
+      h += `<section><h3>First rows</h3><div class="scroll"><table><thead><tr>
+        <th>row_id</th><th>name</th><th>role</th><th>year</th><th>country</th>
+        </tr></thead><tbody>` + data.preview.map(r =>
+        `<tr><td>${esc(r.row_id)}</td><td>${esc(r.name)}</td>
+             <td>${esc(r.role||"—")}</td><td>${esc(r.active_year||"—")}</td>
+             <td>${esc(r.country||"—")}</td></tr>`).join("")
+        + `</tbody></table></div></section>`;
+    }
+    out.innerHTML = h;
+  } finally { btn.disabled = false; }
+}
+
+let lastRows = null;
+
+async function runBulk(){
+  if (!chosen) return;
+  const btn = $("#btn-bulk"); btn.disabled = true;
+  const label = btn.textContent;
+  btn.innerHTML = '<span class="spin"></span>Resolving';
+  out.innerHTML = `<section><div class="decision"><h2>Working…</h2>
+    <p>Roughly 5–10 seconds per name in live mode. This page waits.</p>
+    </div></section>`;
+  try{
+    const fd = new FormData();
+    fd.append("file", chosen);
+    fd.append("max_rows", $("#maxrows").value || "25");
+    const {status, data} = await post("/api/bulk", fd);
+    if (status >= 400){
+      out.innerHTML = `<section><div class="err"><strong>${esc(data.error)}</strong></div></section>`;
+      return;
+    }
+    lastRows = data.rows || [];
+    let h = `<section><div class="decision"><h2>${data.processed} rows resolved</h2>
+      <p>${esc(data.mode)} mode · ${data.seconds}s${
+        data.stopped_because ? " · " + esc(data.stopped_because) : ""}</p>
+      </div>${countsHtml(data.decision_counts)}</section>`;
+
+    if ((data.unprocessed||[]).length)
+      h += `<section><div class="warnbox"><strong>${data.unprocessed.length}
+        row(s) not attempted.</strong> Re-upload a sheet containing just those
+        names — cached lookups make the second pass much faster.</div></section>`;
+    if ((data.skipped||[]).length)
+      h += `<section><div class="warnbox">${data.skipped.length} row(s) skipped
+        (no name).</div></section>`;
+
+    const cols = data.columns || [];
+    h += `<section><h3>Results</h3><div class="scroll"><table><thead><tr>`
+      + cols.map(c => `<th>${esc(c)}</th>`).join("")
+      + `</tr></thead><tbody>`
+      + lastRows.map(r => `<tr>` + cols.map(c => {
+          const v = r[c] ?? "";
+          if (c === "decision")
+            return `<td><span class="dec ${esc(v)}">${esc(v)}</span></td>`;
+          return `<td title="${esc(v)}">${esc(v)}</td>`;
+        }).join("") + `</tr>`).join("")
+      + `</tbody></table></div>
+        <div class="row2">
+          <button id="dl-xlsx">Download Excel</button>
+          <button id="dl-csv" style="background:#E6EAF1;color:var(--ink)">Download CSV</button>
+        </div></section>`;
+    out.innerHTML = h;
+    $("#dl-xlsx").addEventListener("click", () => download("xlsx"));
+    $("#dl-csv").addEventListener("click", () => download("csv"));
+  }catch(e){
+    out.innerHTML = `<section><div class="err"><strong>Upload failed.</strong><br>${esc(e.message)}</div></section>`;
+  }finally{
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+async function download(fmt){
+  if (!lastRows) return;
+  const r = await fetch("/api/bulk/export", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({rows:lastRows, format:fmt})});
+  if (!r.ok) return;
+  const blob = await r.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "talent-finder-results." + fmt;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+$("#btn-validate").addEventListener("click", validateFile);
+$("#btn-bulk").addEventListener("click", runBulk);
 </script>
 </body>
 </html>
