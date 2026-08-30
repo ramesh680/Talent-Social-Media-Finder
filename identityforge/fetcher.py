@@ -47,6 +47,9 @@ RATE_LIMITS: dict[str, float] = {
     "www.wikidata.org": 0.4,
     "api.themoviedb.org": 0.06,
     "serpapi.com": 0.5,
+    "viaf.org": 0.5,
+    "openlibrary.org": 0.5,
+    "www.thesportsdb.com": 0.5,
     "www.omdbapi.com": 0.2,
     "_default": 1.0,
 }
@@ -70,6 +73,9 @@ ALLOWED_SUFFIXES: tuple[str, ...] = (
     "withkoji.com",
     # API providers
     "serpapi.com", "omdbapi.com",
+    # free, keyless vertical sources - no billing attached to any of these
+    "thesportsdb.com", "openlibrary.org", "viaf.org", "orcid.org",
+    "api.deezer.com", "itunes.apple.com",
 )
 
 
@@ -291,4 +297,3 @@ def build_fetcher(offline: bool = False) -> CachedFetcher:
         timeout=_env_int("REQUEST_TIMEOUT_SECONDS", 20),
         offline=offline,
     )
-
