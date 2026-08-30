@@ -296,7 +296,7 @@ def parse_csv(data: bytes) -> ParseResult:
         r.errors.append("Could not decode the file as UTF-8 or Latin-1.")
         return r
     try:
-        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\\t|")
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
     except csv.Error:
         dialect = csv.excel
     reader = list(csv.reader(io.StringIO(text), dialect))
