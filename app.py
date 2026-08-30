@@ -25,6 +25,7 @@ from flask import Response, send_file
 from identityforge import authorities
 from identityforge.authorities import OCCUPATION_BUCKETS
 from identityforge import bulk as bulk_mod
+from identityforge.jobs import JobRunner, JobStore
 from identityforge.template import build_template_csv, build_template_xlsx
 from identityforge.discovery import discover
 from identityforge.fetcher import CachedFetcher, FixtureFetcher, build_fetcher
@@ -50,6 +51,8 @@ def _present(v: str) -> bool:
     return bool(v and v.strip())
 
 _store = EntityStore(DB_PATH)
+_jobs = JobStore(os.environ.get("IF_JOBS_PATH", "/tmp/jobs.db"))
+_runner = JobRunner(_jobs, max_concurrent=int(os.environ.get("IF_JOB_WORKERS", 1)))
 _live_fetcher: CachedFetcher | None = None
 
 
@@ -445,6 +448,112 @@ def bulk_export():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition":
                  'attachment; filename="talent-finder-results.xlsx"'})
+
+
+# ---------------------------------------------------------------------------
+# large batches: submit -> poll -> download
+# ---------------------------------------------------------------------------
+
+MAX_JOB_ROWS = int(os.environ.get("IF_MAX_JOB_ROWS", 1000))
+
+
+def _make_resolver(fetch):
+    def resolve_one(pr):
+        return resolve(
+            Intake(name=pr.name, expected_role=pr.role or None,
+                   country=pr.country or None, active_year=pr.active_year,
+                   context=pr.context, client=pr.client),
+            fetch, _store, tmdb_key=TMDB_KEY, do_bidirectional=False,
+            serpapi_key=SERPAPI_KEY, serpapi_engine=SERPAPI_ENGINE)
+    return resolve_one
+
+
+@app.post("/api/bulk/submit")
+def bulk_submit():
+    """
+    Start a background job. Returns immediately with a job_id.
+
+    This is the route for 250-500 rows: the work outlives the request, so the
+    120s gunicorn timeout stops being the ceiling on batch size.
+    """
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded (form field 'file')."}), 400
+    data = f.read()
+    if not data:
+        return jsonify({"error": "The uploaded file is empty."}), 400
+
+    parsed = bulk_mod.parse_upload(f.filename or "", data)
+    if parsed.errors:
+        return jsonify({"error": parsed.errors[0], "errors": parsed.errors}), 422
+    rows = parsed.valid_rows
+    if not rows:
+        return jsonify({"error": "No rows with a name were found."}), 422
+    if len(rows) > MAX_JOB_ROWS:
+        return jsonify({"error": f"{len(rows)} rows exceeds the {MAX_JOB_ROWS} "
+                                 "row cap for one job. Split the sheet."}), 413
+
+    job_id = _jobs.create(f.filename or "upload", len(rows))
+    _runner.submit(job_id, rows, _make_resolver(_fetcher()),
+                   bulk_mod.flatten_result)
+    est = len(rows) * (7 if LIVE else 0.05)
+    return jsonify({
+        "job_id": job_id, "total": len(rows), "state": "queued",
+        "header_map": parsed.header_map,
+        "estimated_seconds": round(est),
+        "poll": f"/api/bulk/status/{job_id}",
+        "note": ("Keep this page open while it runs. On Render's free tier the "
+                 "instance sleeps when idle, and a sleeping instance is not "
+                 "working on your job."),
+    }), 202
+
+
+@app.get("/api/bulk/status/<job_id>")
+def bulk_status(job_id):
+    st = _jobs.status(job_id)
+    if not st:
+        return jsonify({"error": "Unknown job_id."}), 404
+    return jsonify(st)
+
+
+@app.get("/api/bulk/jobs")
+def bulk_jobs():
+    return jsonify({"jobs": _jobs.recent()})
+
+
+@app.post("/api/bulk/cancel/<job_id>")
+def bulk_cancel(job_id):
+    if not _jobs.status(job_id):
+        return jsonify({"error": "Unknown job_id."}), 404
+    _runner.cancel(job_id)
+    return jsonify(_jobs.status(job_id))
+
+
+@app.get("/api/bulk/result/<job_id>")
+def bulk_result(job_id):
+    """
+    Download whatever is finished - works mid-run, not just at the end, so a
+    long job is never all-or-nothing.
+    """
+    st = _jobs.status(job_id)
+    if not st:
+        return jsonify({"error": "Unknown job_id."}), 404
+    rows = _jobs.rows(job_id)
+    if not rows:
+        return jsonify({"error": "No rows finished yet.", "status": st}), 409
+    fmt = (request.args.get("format") or "xlsx").lower()
+    if fmt == "json":
+        return jsonify({"status": st, "columns": bulk_mod.OUTPUT_COLUMNS,
+                        "rows": rows})
+    if fmt == "csv":
+        return Response(bulk_mod.to_csv(rows), mimetype="text/csv",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="results-{job_id}.csv"'})
+    return Response(
+        bulk_mod.to_xlsx(rows),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 f'attachment; filename="results-{job_id}.xlsx"'})
 
 
 if __name__ == "__main__":
