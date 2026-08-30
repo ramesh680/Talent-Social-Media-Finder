@@ -129,6 +129,20 @@ def canon_header(raw: str, strict: bool = False) -> Optional[str]:
     return None
 
 
+# Headers whose meaning depends on what ELSE is in the sheet.
+#
+# "Title" is the sharp case: in a ListenFirst ingest sheet it means the entity
+# name, but in a talent list next to "Talent Name" it means the profession.
+# Mapping it blindly to `name` made the second column collide with the first,
+# and the collision resolver silently DROPPED it - so every row arrived with no
+# role and nothing could be disambiguated. Deciding by context fixes that.
+AMBIGUOUS_HEADERS: dict[str, list[str]] = {
+    "title": ["name", "role"],
+    "type": ["role"],
+    "category": ["role"],
+}
+
+
 def score_header_row(row: list) -> int:
     """How many cells in `row` are recognisable column headings, strictly."""
     seen = set()
@@ -240,7 +254,14 @@ def _coerce_year(v) -> tuple[Optional[int], str]:
 def _build_rows(header: list, data_rows: Iterable[list]) -> ParseResult:
     res = ParseResult()
     mapping: dict[int, str] = {}
+    deferred: list[tuple[int, object, list[str]]] = []
+
+    # Pass 1: unambiguous headers claim their field.
     for i, h in enumerate(header):
+        k = _norm_header(h)
+        if k in AMBIGUOUS_HEADERS:
+            deferred.append((i, h, AMBIGUOUS_HEADERS[k]))
+            continue
         c = canon_header(h)
         if c:
             # first column wins, so a stray later match cannot hijack a field
@@ -249,6 +270,18 @@ def _build_rows(header: list, data_rows: Iterable[list]) -> ParseResult:
                 res.header_map[str(h)] = c
         elif str(h or "").strip():
             res.unmapped_headers.append(str(h).strip())
+
+    # Pass 2: ambiguous headers take the first candidate still unclaimed, so
+    # "Talent Name" + "Title" reads as name + role rather than name + dropped.
+    for i, h, candidates in deferred:
+        for cand in candidates:
+            if cand not in mapping.values():
+                mapping[i] = cand
+                res.header_map[str(h)] = cand
+                break
+        else:
+            if str(h or "").strip():
+                res.unmapped_headers.append(str(h).strip())
 
     if "name" not in mapping.values():
         res.errors.append(
