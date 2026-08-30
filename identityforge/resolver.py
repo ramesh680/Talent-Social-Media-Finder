@@ -35,11 +35,14 @@ from .authorities import (ALL_AUTHORITIES, BY_KEY, TARGET_AUTHORITIES,
                           role_for_occupation)
 from .aggregators import (harvest, is_aggregator_url, looks_like_aggregator,
                           probe_urls, extract_links, extract_sameas)
-from .evidence import (Candidate, Evidence, HandleClaim, Tier, rank,
-                       score_role_match)
-from .discovery import attach_as_unverified, discover
+from .discovery import (DiscoveryResult, Proposal,
+                        attach_as_unverified, discover)
 from .providers import enrich_from_tmdb
 from .wikidata import find_candidates
+from .wikibridge import qids_for_articles
+from .freesearch import free_discover
+from .evidence import (Candidate, Evidence, HandleClaim, Tier, rank,
+                       score_role_match)
 from .platforms import (Platform, PlatformRef, TARGET_PLATFORMS, build_url,
                         classify_url)
 
@@ -427,7 +430,7 @@ def _now() -> str:
 def resolve(intake: Intake, fetch: Fetch, store: Optional[EntityStore] = None,
             tmdb_key: str = "", do_bidirectional: bool = True,
             serpapi_key: str = "", serpapi_engine: str = "google",
-            allow_discovery: bool = True) -> dict:
+            allow_discovery: bool = True, free_probe: bool = False) -> dict:
     known = store.known_collision(intake.name) if store else None
 
     candidates = discover_candidates(intake, fetch)
@@ -435,10 +438,172 @@ def resolve(intake: Intake, fetch: Fetch, store: Optional[EntityStore] = None,
     # No Wikidata item at all - the micro-influencer long tail. Search is the
     # only way to get a seed here, and everything it returns stays unverified
     # until the cascade corroborates it.
-    if not candidates and allow_discovery and serpapi_key:
-        disc = discover(intake.name, fetch, serpapi_key,
-                        role=intake.expected_role or "",
-                        engine=serpapi_engine)
+    if not candidates and allow_discovery:
+        # FREE FIRST. MusicBrainz and MediaWiki cost nothing and cover a large
+        # share of real talent lists, so paid search is a fallback rather than
+        # the default. At 15k names this is the difference between ~$840 and
+        # a bill that only covers what the free sources genuinely missed.
+        free = free_discover(intake.name, fetch,
+                             role=intake.expected_role or "",
+                             country=intake.country or "",
+                             try_probe=free_probe)
+
+        if free.social_refs or free.wikipedia_urls:
+            disc = DiscoveryResult()
+            disc.wikipedia_urls = list(free.wikipedia_urls)
+            disc.stopped_early = "resolved by free sources - no paid search"
+            for ref in free.social_refs:
+                disc.proposals.append(Proposal(
+                    ref=ref, query="musicbrainz:url-rels", rank=1,
+                    title="", snippet="", name_in_title=True))
+            free_used = True
+        elif serpapi_key:
+            disc = discover(intake.name, fetch, serpapi_key,
+                            role=intake.expected_role or "",
+                            engine=serpapi_engine)
+            free_used = False
+        else:
+            return {"decision": "not_found",
+                    "reason": ("No entity in the identity graph, and the free "
+                               "sources (MusicBrainz, MediaWiki) found nothing. "
+                               "Set SERPAPI_API_KEY to enable paid search."),
+                    "free_calls": free.calls, "free_notes": free.notes,
+                    "candidates": [], "cards": []}
+
+        # A Wikipedia hit is a bridge, not a dead end: the article maps 1:1 to
+        # a Wikidata item, so we can re-enter the STRUCTURED pipeline and get
+        # every platform id at Tier 1 instead of shipping search guesses.
+        if disc.wikipedia_urls:
+            qids = qids_for_articles(disc.wikipedia_urls, fetch)
+            disc.bridged_qids = qids
+            for qid in qids[:2]:
+                cand = Candidate(entity_id=qid, label=intake.name)
+                harvest_structured_ids(cand, fetch)
+                if cand.claims:
+                    cand.label_match = {"score": 0.75, "how": "wikipedia_bridge",
+                                        "matched": disc.wikipedia_urls[0]}
+                    candidates.append(cand)
+            if candidates:
+                for c in candidates:
+                    score_role_match(c, intake.expected_role, intake.country,
+                                     intake.active_year)
+                decision = rank(candidates)
+                if decision["decision"] == "resolved":
+                    cand = decision["winner"]
+                else:
+                    cand = candidates[0]
+                if tmdb_key:
+                    enrich_from_tmdb(cand, fetch, tmdb_key, intake.expected_role)
+                fill_from_musicbrainz(cand, fetch)
+
+                # Same cascade as the normal path: a Wikidata social handle on
+                # its own is Tier 1 and only reaches "review". Reading the
+                # person's own bio link adds Tier 2 self-declared evidence,
+                # which is what promotes a handle to accepted.
+                for plat in (Platform.INSTAGRAM, Platform.TWITTER,
+                             Platform.YOUTUBE, Platform.TIKTOK):
+                    seed = next((c for c in cand.claims.values()
+                                 if c.ref.platform is plat), None)
+                    if seed:
+                        html = fetch(seed.ref.canonical_url, kind="text")
+                        if isinstance(html, str) and html:
+                            cascade_from_seed(cand, html,
+                                              seed.ref.canonical_url, fetch)
+                        break
+                for agg in disc.aggregator_urls[:2]:
+                    html = fetch(agg, kind="text")
+                    if isinstance(html, str) and html:
+                        for ref in harvest(html):
+                            cand.add_claim(ref, Evidence(
+                                Tier.SELF_DECLARED, "aggregator", agg))
+                if store:
+                    store.save(cand)
+                return {
+                    "decision": "resolved",
+                    "via": "wikipedia_bridge",
+                    "entity_id": cand.entity_id,
+                    "label": cand.label,
+                    "roles": cand.roles,
+                    "external_ids": cand.external_ids,
+                    "coverage": cand.coverage(TARGET_PLATFORMS),
+                    "queries_run": disc.queries_run,
+                    "handles": {
+                        plat.value: [
+                            {"handle": c.ref.handle, "lang": c.ref.lang,
+                             "url": c.ref.canonical_url,
+                             "confidence": c.confidence(),
+                             "tiers": sorted(int(t) for t in c.tiers),
+                             "sources": [e.source for e in c.evidence]}
+                            for c in claims
+                        ] for plat, claims in cand.accepted().items()
+                    },
+                    "needs_review": [
+                        {"platform": c.ref.platform.value, "handle": c.ref.handle,
+                         "confidence": c.confidence(),
+                         "tiers": sorted(int(t) for t in c.tiers),
+                         "sources": [e.source for e in c.evidence]}
+                        for c in cand.claims.values() if c.verdict() == "review"
+                    ],
+                }
+
+        if free_used and disc.proposals:
+            # MusicBrainz url-rels are declared on the artist's own catalogue
+            # record, so they are self-declared evidence (Tier 2), not a search
+            # guess (Tier 5). That difference is what lets them be accepted.
+            cand = Candidate(entity_id=f"mb:{(free.musicbrainz_ids or ['?'])[0]}",
+                             label=intake.name,
+                             roles=[intake.expected_role] if intake.expected_role else [])
+            for p_ in disc.proposals:
+                cand.add_claim(p_.ref, Evidence(
+                    Tier.STRUCTURED_ID, "musicbrainz:url-rel",
+                    p_.ref.canonical_url))
+
+            # One structured source only reaches "review". Reading the artist's
+            # own bio link adds Tier 2 self-declared evidence and promotes the
+            # handles to accepted - and costs nothing, since it is a plain page
+            # fetch rather than a billed search.
+            for plat in (Platform.INSTAGRAM, Platform.TWITTER,
+                         Platform.YOUTUBE, Platform.TIKTOK):
+                seed = next((c for c in cand.claims.values()
+                             if c.ref.platform is plat), None)
+                if seed:
+                    html = fetch(seed.ref.canonical_url, kind="text")
+                    if isinstance(html, str) and html:
+                        cascade_from_seed(cand, html, seed.ref.canonical_url,
+                                          fetch)
+                    break
+            for agg in free.aggregator_urls[:2]:
+                html = fetch(agg, kind="text")
+                if isinstance(html, str) and html:
+                    for ref in harvest(html):
+                        cand.add_claim(ref, Evidence(
+                            Tier.SELF_DECLARED, "aggregator", agg))
+            if store:
+                store.save(cand)
+            return {
+                "decision": "resolved", "via": "musicbrainz",
+                "entity_id": cand.entity_id, "label": cand.label,
+                "roles": cand.roles,
+                "external_ids": {"musicbrainz_artist": (free.musicbrainz_ids or [""])[0]},
+                "coverage": cand.coverage(TARGET_PLATFORMS),
+                "free_calls": free.calls, "paid_searches": 0,
+                "handles": {
+                    plat.value: [
+                        {"handle": c.ref.handle, "lang": c.ref.lang,
+                         "url": c.ref.canonical_url, "confidence": c.confidence(),
+                         "tiers": sorted(int(t) for t in c.tiers),
+                         "sources": [e.source for e in c.evidence]}
+                        for c in claims
+                    ] for plat, claims in cand.accepted().items()
+                },
+                "needs_review": [
+                    {"platform": c.ref.platform.value, "handle": c.ref.handle,
+                     "confidence": c.confidence(),
+                     "sources": [e.source for e in c.evidence]}
+                    for c in cand.claims.values() if c.verdict() == "review"
+                ],
+            }
+
         prov = [p.as_dict() for p in disc.proposals]
         result = {"decision": "unverified_only",
                   "reason": ("No entity in the identity graph, so nothing can be "
@@ -447,7 +612,9 @@ def resolve(intake: Intake, fetch: Fetch, store: Optional[EntityStore] = None,
                   "proposals": prov,
                   "proposals_by_platform": disc.by_platform(),
                   "aggregator_urls": disc.aggregator_urls,
+                  "wikipedia_urls": disc.wikipedia_urls,
                   "queries_run": disc.queries_run,
+                  "stopped_early": disc.stopped_early,
                   "errors": disc.errors,
                   "candidates": [], "cards": []}
         if store:
