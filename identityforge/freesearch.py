@@ -39,6 +39,7 @@ HONEST LIMITS
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -97,15 +98,36 @@ COUNTRY_LANGS: dict[str, tuple[str, ...]] = {
 }
 
 
+# Which Wikipedia editions to search. Default is English only.
+#
+# Multilingual routing is still implemented below and costs nothing per call -
+# MediaWiki is free - but each extra language is another rate-limited round
+# trip, and at 300 rows that latency is what you actually feel. English only
+# means exactly one call per name.
+#
+# Set WIKIPEDIA_LANGS to re-enable it without touching code:
+#   WIKIPEDIA_LANGS=auto          script + country routing (widest coverage)
+#   WIKIPEDIA_LANGS=en,hi,ta      an explicit list
+WIKIPEDIA_LANGS = os.environ.get("WIKIPEDIA_LANGS", "en").strip()
+
+
 def languages_for(name: str, country: str = "",
                   max_langs: int = 3) -> list[str]:
     """
     Which Wikipedia editions to search for this person.
 
-    Combines the name's own script (a Devanagari name -> hi) with the country
-    hint (an Indian actor with a Latin-spelled name -> hi, ta), and always
-    keeps English because most notable people have an English article too.
+    With WIKIPEDIA_LANGS=auto, combines the name's own script (a Devanagari
+    name -> hi) with the country hint (an Indian actor with a Latin-spelled
+    name -> hi, ta), always keeping English as a fallback.
+
+    Otherwise returns the configured list verbatim - 'en' by default, which is
+    one call per name.
     """
+    mode = WIKIPEDIA_LANGS.lower()
+    if mode and mode != "auto":
+        fixed = [lg.strip() for lg in mode.split(",") if lg.strip()]
+        return fixed[:max_langs] or ["en"]
+
     langs: list[str] = []
     for lg in search_languages(name):
         if lg not in langs:
