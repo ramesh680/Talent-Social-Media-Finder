@@ -166,6 +166,10 @@ footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
 .dec.not_found,.dec.error{background:#FBECEB;color:var(--reject)}
 .warnbox{border-left:3px solid var(--review);background:#FDF9F0;padding:12px 16px;
   border-radius:3px;font-size:13.5px;margin-top:12px}
+.prog{height:6px;background:#E6EAF1;border-radius:3px;overflow:hidden;margin:10px 0}
+.prog i{display:block;height:100%;background:var(--structured);width:0;
+  transition:width .4s ease}
+.jobline{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--ink-soft)}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid #fff;
   border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;
   vertical-align:-2px;margin-right:8px}
@@ -234,17 +238,19 @@ footer{border-top:1px solid var(--rule);margin-top:56px;padding-top:18px;
     <div class="row2">
       <div class="field">
         <label for="maxrows">Max rows this run</label>
-        <input id="maxrows" value="25" inputmode="numeric">
+        <input id="maxrows" value="300" inputmode="numeric">
       </div>
       <button id="btn-validate" style="background:#E6EAF1;color:var(--ink)">Check file only</button>
       <button id="btn-bulk" disabled>Resolve all rows</button>
+      <button id="btn-cancel" hidden style="background:#E6EAF1;color:var(--ink)">Cancel</button>
     </div>
     <p class="hint">Download the template:
       <a href="/api/template.xlsx">Excel</a> ·
       <a href="/api/template.csv">CSV</a>.
       A live run costs roughly 5–10s per name because upstream rate limits are
-      respected, so keep batches small and resubmit what comes back as
-      unprocessed.</p>
+      respected — 300 rows is roughly 30 minutes. The run happens in the
+      background, so leave this tab open and download partial results whenever
+      you like.</p>
   </div>
 
   <div id="out"></div>
@@ -475,79 +481,120 @@ async function validateFile(){
 }
 
 let lastRows = null;
+let currentJob = null;
+let pollTimer = null;
 
+/* The synchronous endpoint stops at a ~75s budget, which is only about a dozen
+   rows once live lookups are involved. Submitting a job moves the work off the
+   request, so batch size stops being bounded by the HTTP timeout. */
 async function runBulk(){
   if (!chosen) return;
   const btn = $("#btn-bulk"); btn.disabled = true;
   const label = btn.textContent;
-  btn.innerHTML = '<span class="spin"></span>Resolving';
-  out.innerHTML = `<section><div class="decision"><h2>Working…</h2>
-    <p>Roughly 5–10 seconds per name in live mode. This page waits.</p>
-    </div></section>`;
+  btn.innerHTML = '<span class="spin"></span>Submitting';
+  out.innerHTML = "";
   try{
     const fd = new FormData();
     fd.append("file", chosen);
-    fd.append("max_rows", $("#maxrows").value || "25");
-    const {status, data} = await post("/api/bulk", fd);
-    if (status >= 400){
-      out.innerHTML = `<section><div class="err"><strong>${esc(data.error)}</strong></div></section>`;
+    fd.append("max_rows", $("#maxrows").value || "300");
+    const r = await fetch("/api/bulk/submit", {method:"POST", body:fd});
+    const d = await r.json();
+    if (r.status >= 400){
+      out.innerHTML = `<section><div class="err"><strong>${esc(d.error)}</strong></div></section>`;
       return;
     }
-    lastRows = data.rows || [];
-    let h = `<section><div class="decision"><h2>${data.processed} rows resolved</h2>
-      <p>${esc(data.mode)} mode · ${data.seconds}s${
-        data.stopped_because ? " · " + esc(data.stopped_because) : ""}</p>
-      </div>${countsHtml(data.decision_counts)}</section>`;
-
-    if ((data.unprocessed||[]).length)
-      h += `<section><div class="warnbox"><strong>${data.unprocessed.length}
-        row(s) not attempted.</strong> Re-upload a sheet containing just those
-        names — cached lookups make the second pass much faster.</div></section>`;
-    if ((data.skipped||[]).length)
-      h += `<section><div class="warnbox">${data.skipped.length} row(s) skipped
-        (no name).</div></section>`;
-
-    const cols = data.columns || [];
-    h += `<section><h3>Results</h3><div class="scroll"><table><thead><tr>`
-      + cols.map(c => `<th>${esc(c)}</th>`).join("")
-      + `</tr></thead><tbody>`
-      + lastRows.map(r => `<tr>` + cols.map(c => {
-          const v = r[c] ?? "";
-          if (c === "decision")
-            return `<td><span class="dec ${esc(v)}">${esc(v)}</span></td>`;
-          return `<td title="${esc(v)}">${esc(v)}</td>`;
-        }).join("") + `</tr>`).join("")
-      + `</tbody></table></div>
-        <div class="row2">
-          <button id="dl-xlsx">Download Excel</button>
-          <button id="dl-csv" style="background:#E6EAF1;color:var(--ink)">Download CSV</button>
-        </div></section>`;
-    out.innerHTML = h;
-    $("#dl-xlsx").addEventListener("click", () => download("xlsx"));
-    $("#dl-csv").addEventListener("click", () => download("csv"));
+    currentJob = d.job_id;
+    $("#btn-cancel").hidden = false;
+    renderProgress({state:"queued", processed:0, total:d.total, percent:0,
+                    counts:{}}, d.estimated_seconds);
+    pollTimer = setInterval(pollJob, 3000);
+    pollJob();
   }catch(e){
-    out.innerHTML = `<section><div class="err"><strong>Upload failed.</strong><br>${esc(e.message)}</div></section>`;
+    out.innerHTML = `<section><div class="err"><strong>Submit failed.</strong><br>${esc(e.message)}</div></section>`;
   }finally{
     btn.disabled = false; btn.textContent = label;
   }
 }
 
+function renderProgress(st, eta){
+  const done = ["done","failed","cancelled"].includes(st.state);
+  out.innerHTML = `<section><div class="decision">
+      <h2>${done ? esc(st.state) : "Working"} — ${st.processed} of ${st.total}</h2>
+      <div class="prog"><i style="width:${st.percent||0}%"></i></div>
+      <p class="jobline">job ${esc(currentJob||"")} · ${st.percent||0}%${
+        eta ? " · est " + Math.round(eta/60) + " min" : ""}</p>
+      ${st.error ? '<p class="jobline">'+esc(st.error)+'</p>' : ""}
+    </div>${countsHtml(st.counts)}</section>
+    <section><p class="hint">Results are written row by row, so you can download
+      what is finished at any time — you do not have to wait for the whole run.</p>
+    </section>`;
+}
+
+async function pollJob(){
+  if (!currentJob) return;
+  try{
+    const r = await fetch(`/api/bulk/status/${currentJob}`);
+    if (!r.ok) return;
+    const st = await r.json();
+    renderProgress(st);
+    if (["done","failed","cancelled"].includes(st.state)){
+      clearInterval(pollTimer); pollTimer = null;
+      $("#btn-cancel").hidden = true;
+      await showResults(st);
+    }
+  }catch(e){ /* transient network blip - keep polling */ }
+}
+
+async function showResults(st){
+  const r = await fetch(`/api/bulk/result/${currentJob}?format=json`);
+  if (!r.ok){
+    out.innerHTML += `<section><div class="warnbox">No rows finished.</div></section>`;
+    return;
+  }
+  const d = await r.json();
+  lastRows = d.rows || [];
+  const cols = d.columns || [];
+  let h = `<section><h3>${lastRows.length} results</h3><div class="scroll"><table><thead><tr>`
+    + cols.map(c => `<th>${esc(c)}</th>`).join("") + `</tr></thead><tbody>`
+    + lastRows.map(row => `<tr>` + cols.map(c => {
+        const v = row[c] ?? "";
+        if (c === "decision")
+          return `<td><span class="dec ${esc(v)}">${esc(v)}</span></td>`;
+        return `<td title="${esc(v)}">${esc(v)}</td>`;
+      }).join("") + `</tr>`).join("")
+    + `</tbody></table></div>
+      <div class="row2">
+        <button id="dl-xlsx">Download Excel</button>
+        <button id="dl-csv" style="background:#E6EAF1;color:var(--ink)">Download CSV</button>
+      </div></section>`;
+  out.innerHTML += h;
+  $("#dl-xlsx").addEventListener("click", () => download("xlsx"));
+  $("#dl-csv").addEventListener("click", () => download("csv"));
+}
+
+async function cancelJob(){
+  if (!currentJob) return;
+  await fetch(`/api/bulk/cancel/${currentJob}`, {method:"POST"});
+  if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+  $("#btn-cancel").hidden = true;
+  pollJob();
+}
+
 async function download(fmt){
-  if (!lastRows) return;
-  const r = await fetch("/api/bulk/export", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({rows:lastRows, format:fmt})});
+  if (!currentJob) return;
+  const r = await fetch(`/api/bulk/result/${currentJob}?format=${fmt}`);
   if (!r.ok) return;
   const blob = await r.blob();
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "talent-finder-results." + fmt;
+  a.download = `talent-finder-results-${currentJob}.${fmt}`;
   document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(a.href);
 }
 
 $("#btn-validate").addEventListener("click", validateFile);
 $("#btn-bulk").addEventListener("click", runBulk);
+$("#btn-cancel").addEventListener("click", cancelJob);
 </script>
 </body>
 </html>
