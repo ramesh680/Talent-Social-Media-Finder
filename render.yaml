@@ -7,10 +7,13 @@ services:
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
     healthCheckPath: /api/health
     envVars:
-      # Demo mode by default. Set IF_LIVE=1 in the Render dashboard only once
-      # you have reviewed the rate-limiting policy in identityforge/fetcher.py.
+      # IF_LIVE is sync:false ON PURPOSE. It was previously value:"0" here,
+      # which meant every blueprint sync silently reset the dashboard setting
+      # back to demo mode - so a push quietly stopped the app making any real
+      # requests and every row came back not_found. sync:false makes Render
+      # prompt once and then leave the operator's value alone.
       - key: IF_LIVE
-        value: "0"
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12.4"
       - key: SERPAPI_ENGINE
